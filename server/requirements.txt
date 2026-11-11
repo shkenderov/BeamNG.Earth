@@ -10,3 +10,4 @@ fsspec              # DuckDB reads the remote files through rangeread.NetfetchFS
 certifi             # the packaged app's CA certificates where the system has none it finds (launcher.py)
 
 truststore>=0.10.4  # Windows: use native CryptoAPI chain validation (HTTPS)
+zstandard           # ZSTD-compressed GeoTIFF tiles (cog.py; Pillow's Windows libtiff has none): Sofia's terrain model

@@ -5,7 +5,8 @@ BigTIFF, either byte order, tiled single-band images of 8/16/32-bit integers or 
 compression none / Deflate (zlib, from the standard library) / PackBits, predictor 1 (none), 2
 (horizontal differencing) or 3 (floating point, float32: the Copernicus DEM); any other compression
 libtiff knows (LZW, GDAL's default for COGs: NRCan's HRDEM; ZSTD, LZMA) through Pillow's libtiff, the
-tile wrapped in a one-strip TIFF of its own (_libtiff_decode). The geotransform
+tile wrapped in a one-strip TIFF of its own (_libtiff_decode); ZSTD with the zstandard package where it
+is installed (_zstd: Pillow's Windows wheels have no ZSTD in their libtiff). The geotransform
 comes from ModelPixelScale + ModelTiepoint, the CRS from the GeoKeys (EPSG of the geographic or
 projected type), nodata from GDAL's tag 42113. The full-resolution image (the first IFD) is read,
 or one of the overviews after it (level); masks are skipped. A TileCache keeps decoded tiles.
@@ -49,6 +50,29 @@ class _Lazy:
 
     def __init__(self, off, typ, cnt):
         self.off, self.typ, self.cnt = off, typ, cnt
+
+
+_zstd_tl = threading.local()
+
+
+def _zstd(data, size):
+    """A ZSTD block (compression 50000) inflated with the zstandard package: at most size bytes; None when the
+    package is not installed (Pillow's libtiff decodes it then, where it can: its Windows wheels answer "ZSTD
+    compression support is not configured", so Sofia's terrain model, sofiadtm.py, was not readable there)."""
+    d = getattr(_zstd_tl, "d", None)
+    if d is None:
+        try:
+            import zstandard
+            d = zstandard.ZstdDecompressor()        # (one per thread: a decompressor is not shared between threads)
+        except ImportError:
+            d = False
+        _zstd_tl.d = d
+    if d is False:
+        return None
+    try:
+        return d.decompress(data, max_output_size=size)
+    except Exception as e:
+        raise CogError(f"ZSTD block not decodable: {e}") from None
 
 
 TABLE_PIECE = 256 * 1024    # bytes of a long tile table read at a time (rangeread's block)
@@ -331,10 +355,16 @@ class Cog:
                 a = np.frombuffer(data, np.uint8, count=self.tile_w * rows * self.bands)
                 return a.reshape(rows, self.tile_w, self.bands)
             return self._libtiff_decode(data, rows)
-        if self.compression == "libtiff" or (self.predictor == 2 and self.dtype.kind == "f"):
+        float_pred2 = self.predictor == 2 and self.dtype.kind == "f"
+        if self.compression == "libtiff" or float_pred2:
             # (libtiff's predictor 2 on floats differences their 32-bit words, not the float values)
-            return self._libtiff_decode(data, rows)
-        if self.compression == "deflate":
+            raw = None
+            if self.compression_code == 50000 and not float_pred2:      # ZSTD: here, when the package is installed
+                raw = _zstd(data, self.tile_w * rows * self.dtype.itemsize)
+            if raw is None:
+                return self._libtiff_decode(data, rows)
+            data = raw
+        elif self.compression == "deflate":
             data = zlib.decompress(data)
         elif self.compression == "packbits":
             data = _packbits(data, self.tile_w * rows * self.dtype.itemsize)

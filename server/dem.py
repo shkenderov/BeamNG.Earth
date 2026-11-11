@@ -42,6 +42,7 @@ import hrdem as hrdemmod
 import lidarbc as lidarbcmod
 import netfetch
 import polardem
+import sofiadtm as sofiamod
 import staging
 
 log = logging.getLogger("earthd.dem")
@@ -255,6 +256,9 @@ class Dem:
         self.lidarbc_sparse = (lidarbcmod.LidarBC(os.path.join(cache_dir, "lidarbc-sparse"), self.fetcher,
                                                   block=BIAS_BLOCK) if LIDARBC else None)
         self.hrdem_served = set()       # tile keys with HRDEM heights in them (the data credits)
+        # Sofia Municipality's own 1 m terrain model, a file on this computer (sofiadtm.py: BNE_SOFIA_DTM; None without)
+        self.sofia = sofiamod.from_env()
+        self.sofia_served = set()
 
 
     def clear_memory(self):
@@ -267,8 +271,59 @@ class Dem:
         if a is None or z < GLOBAL_ZOOM:
             return a
         if z < FINE_MIN_ZOOM:
-            return self._bc_bias(key, self._hrdem_bias(key, a))
-        return self._canada_fine(key, a)
+            return self._sofia_bias(key, self._bc_bias(key, self._hrdem_bias(key, a)))
+        return self._sofia_fine(key, self._canada_fine(key, a))
+
+    def _sofia_bias(self, key, a):
+        """Distant tile key's heights a shifted to Sofia's terrain model (its 32 m overview) where the global model
+        sits off it (buildings' and forests' tops, Vitosha's: the rings inside are the terrain model itself)."""
+        z, x, y = key
+        src = getattr(self, "sofia", None)
+        if src is None or z not in BIAS_ZOOMS or not src.covers(z, x, y):
+            return a
+        try:
+            got = src.tile(z, x, y, size=HRDEM_BIAS_PX, min_px=HRDEM_BIAS_M)
+        except (OSError, ValueError) as e:
+            self._count("sofia-bias:error")
+            self._partial()
+            log.debug("sofia bias %s: %s", key, e)
+            return a
+        if got is None:
+            return a
+        h, ok = got
+        lat, lon = hrdemmod.tile_lat_lon(z, x, y, HRDEM_BIAS_PX)
+        out = self._shift_to(key, a, lat[ok], lon[ok], h[ok])
+        if out is not a:
+            self._count("sofia-bias:tile")
+            with self._lock:
+                self.sofia_served.add(key)
+        return out
+
+    def _sofia_fine(self, key, a):
+        """Near tile key's heights a (z15 and deeper) with Sofia's terrain model put in where it has heights,
+        feathered into a's over HRDEM_FEATHER_M at its edge (the municipality's border)."""
+        z, x, y = key
+        src = getattr(self, "sofia", None)
+        if src is None or not src.covers(z, x, y):
+            return a
+        try:
+            got = src.tile(z, x, y)
+        except (OSError, ValueError) as e:
+            self._count("sofia:error")
+            self._partial()                     # (not mirrored: asked again next time)
+            log.debug("sofia %s: %s", key, e)
+            return a
+        if got is None:
+            return a
+        h, ok = got
+        n = 2 ** z
+        lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 0.5) / n))))
+        px = 40075016.686 * math.cos(math.radians(lat)) / n / TILE
+        w = hrdemmod.feather(ok, min(HRDEM_FEATHER_MAX_PX, max(2, round(HRDEM_FEATHER_M / px))))
+        self._count("sofia:tile")
+        with self._lock:
+            self.sofia_served.add(key)
+        return (a * (1.0 - w) + h * w).astype(np.float32)
 
     def _hrdem_bias(self, key, a):
         """Distant tile key's heights a shifted to HRDEM's ground (read from a coarse overview) where Mapterhorn's sit
@@ -467,10 +522,31 @@ class Dem:
                 c["at"], c["failed"] = now, True
             return c["index"]
 
+    def fine_at(self, lat, lon):
+        """Is the elevation at the points (arrays) a terrain model fine enough to hold a stream's own channel (Sofia's
+        1 m model, sofiadtm.py)? seacarve's river lines look for the channel there (seacarve.SNAP_*)."""
+        sofia = getattr(self, "sofia", None)
+        lat = np.asarray(lat, np.float64)
+        if sofia is None:
+            return np.zeros(lat.shape, bool)
+        return np.asarray(sofia.valid_at(lat, np.asarray(lon, np.float64)), bool)
+
+    def fine_tag(self, z, x, y):
+        """A name for the fine terrain model tile (z, x, y) touches ("" where none): caches of what is made from the
+        ground there (seacarve's water levels) keep those made with it apart from those made without."""
+        sofia = getattr(self, "sofia", None)
+        if sofia is not None and sofia.covers(z, x, y):
+            return f"sofia{sofia.tag}"
+        return ""
+
     def coarse_at(self, lat, lon):
         """Is the elevation at (lat, lon) only the coarse global model (Mapterhorn's file list has nothing deeper than
         GLOBAL_ZOOM under its z6 tile: no lidar, ~30 m Copernicus and the like)? False when unknown (no list yet) or
-        where the opt-in Canadian lidar reads. grading.ease_coarse (GitHub #414)."""
+        where the opt-in Canadian lidar or Sofia's terrain model (sofiadtm.py) reads. grading.ease_coarse (GitHub
+        #414)."""
+        sofia = getattr(self, "sofia", None)
+        if sofia is not None and sofia.valid_at(float(lat), float(lon)):
+            return False
         idx = self._coverage()
         if idx is None:
             return False
@@ -648,7 +724,13 @@ class Dem:
     # --- the decoded mirror (MIRROR_MB) ----------------------------------------------------------
     def _mirror_path(self, key):
         z, x, y = key
-        return os.path.join(self.cache_dir, "decoded", f"v{DECODED_VERSION}", f"g{int(self.ground_filter)}", str(z),
+        g = f"g{int(self.ground_filter)}"
+        # (the tiles Sofia's terrain model reaches, z12 and deeper, in a folder of their own: not the ones made
+        # without the file, nor read by a server run without it)
+        sofia = getattr(self, "sofia", None)
+        if sofia is not None and z >= GLOBAL_ZOOM and sofia.covers(z, x, y):
+            g += f"-sofia{sofia.tag}"
+        return os.path.join(self.cache_dir, "decoded", f"v{DECODED_VERSION}", g, str(z),
                             str(x), f"{y}{'.f32z' if MIRROR_ZSTD else '.npy'}")
 
     def _mirror_get(self, key, readback=False):
