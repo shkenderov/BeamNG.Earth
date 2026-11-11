@@ -707,6 +707,20 @@ BURIED_LV = {"NL": 1.0, "CH": 0.86, "GB": 0.81, "DE": 0.75, "DK": 0.65, "BE": 0.
 def buried_share(country):
     """The share of the country's (ISO 3166 alpha-2) low-voltage lines underground (BURIED_LV), else 0."""
     return BURIED_LV.get(str(country or "").upper(), 0.0)
+
+
+# Countries whose lines are mostly overhead (not in BURIED_LV) but buried in their built-up land: the share of the
+# roads there (Spec.urban: the land cover) that guess no utility poles, their lamps on posts instead, as where the
+# country's lines are buried. The country roads keep their poles. Bulgaria (the player, 2026-11-10: "electric poles sit
+# randomly in the middle of the roads; in Bulgaria's cities there are none"): nearly all of inner Sofia's medium- and
+# low-voltage network is underground, overhead lines only on its outskirts (gradat.bg, 2013-05-27, on CEZ's Sofia grid).
+# (Its villages are built-up land too and lose their real poles with it: the land cover does not tell them apart.)
+URBAN_BURIED_LV = {"BG": 1.0}
+
+
+def urban_buried_share(country):
+    """The share of the country's built-up roads whose lines are underground (URBAN_BURIED_LV), else 0."""
+    return URBAN_BURIED_LV.get(str(country or "").upper(), 0.0)
 # The lamps' lenses (night lighting: nightlights.lua lights their material after dusk and puts its lights at them;
 # tools/build_lamp_lens.py): the stock heads' glass is a material every building's windows share. At each lamp's glass
 # (the centroid of its transparent vertices in the stock mesh, its local frame: x along the row's yaw; measured by
@@ -780,6 +794,17 @@ COLLISION_BOXES = {
 COLLISION_BOXES.update(citylamps.COLLISION_BOXES)
 COLLISION_BOXES.update(designsigns.BOXES)
 ROAD_PROP_GAP_M = 0.15
+
+
+def collision_shape(group):
+    """COLLISION_BOXES' entry of a row's group, or None: nothing to test. The regional pole styles (poleprofiles.py:
+    eu_pole_<family>, eu_wood_pole, fr_wood_pole, pole_concrete_recessed) take the stock pole's boxes, scaled to
+    their own height by the caller: they had none, RoadClearance.clear passed every one of them and Europe's guessed
+    poles stood in carriageways (Sofia, the player 2026-11-10; the default --regional-poles europe)."""
+    shape = COLLISION_BOXES.get(group)
+    if shape is None and poleprofiles.is_pole_group(group):
+        shape = COLLISION_BOXES[G_POLE]
+    return shape
 
 
 def _box_distance2(a, b, low, high):
@@ -884,7 +909,7 @@ class RoadClearance:
         """Whether every scaled collider box clears the traffic envelope and a deck's structural underside: each road
         segment clipped to the object's vertical collision interval first (a second hairpin branch or a rising road
         beside an overhead arm), then the box's distance to it in the object's frame (earthfast.Clearance)."""
-        shape = COLLISION_BOXES.get(row[0])
+        shape = collision_shape(row[0])
         if shape is None:
             return True
         import roads
@@ -1079,6 +1104,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
     by_fid = {fid: (spec, pts) for fid, spec, pts, _ in roads}
     mapped = (np.asarray(mapped_poles, np.float64).reshape(-1, 2) if mapped_poles is not None
               else np.empty((0, 2)))
+    urban_buried = urban_buried_share(country)
     along = {}
 
     def mapped_along(fid):      # are there mapped poles along this road (mappedpoles.py draws those instead)?
@@ -1100,6 +1126,8 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
             return False
         if mapped_along(fid):
             return False
+        if sp is not None and sp.urban and urban_buried > 0.0 and _h01(fid, "buried-urban") < urban_buried:
+            return False                # (a town street of a country whose towns' lines are buried: URBAN_BURIED_LV)
         return _h01(fid, "buried") >= buried
     clearance = clearance if clearance is not None else RoadClearance(
         [(spec.width / 2, pts) for _, spec, pts, _ in roads], decks, bounds=box)

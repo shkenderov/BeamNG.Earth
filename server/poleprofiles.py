@@ -24,6 +24,15 @@ STOCK = PoleStyle("pole", 9.2)
 RECESSED = PoleStyle("pole_concrete_recessed", 8.5, ((0.25, 0.0, 7.85),), 0.025)
 WOOD = PoleStyle("fr_wood_pole", 8.5, RECESSED.wire_anchors, RECESSED.wire_radius)
 EU_WOOD = PoleStyle("eu_wood_pole", 8.5, RECESSED.wire_anchors, RECESSED.wire_radius)
+POLE_GROUPS = frozenset(s.group for s in (STOCK, RECESSED, WOOD, EU_WOOD))
+
+
+def is_pole_group(group):
+    """Is a prop row's group a utility pole of any style here (the stock one, France's, Europe's eu_pole_<family>)?
+    furniture.collision_shape: every style is kept off the carriageways as the stock pole is."""
+    return group in POLE_GROUPS or str(group).startswith("eu_pole_")
+
+
 FR_KIT = "fr-varied-furniture-v3"
 EU_KIT = europeinfra.VERSION
 # Explicit country/territory coverage, including the requested RU/TR presets.

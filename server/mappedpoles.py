@@ -114,13 +114,16 @@ def _french_kit(pole_profile):
     return franceroads.ON and poleprofiles.kit_enabled(pole_profile)
 
 
-def place(frame, box, layers, elev, props, wires, pole_profile, urban_fn=None, everywhere=False):
+def place(frame, box, layers, elev, props, wires, pole_profile, urban_fn=None, everywhere=False, clearance=None):
     """Append mapped rural FR props and wires in the existing furniture formats.
 
     Points retain their mapped side and coordinates. Missing mapping is unknown,
     not evidence of a buried network. No photo/location-specific exception.
     everywhere: the mapped poles of every country (the stock pole and wires), but France's while its own scenery
     places them; urban_fn is not used.
+    clearance: the tile's furniture.RoadClearance: a mapped pole standing in a carriageway (a node on a median the
+    map draws as one road, a misplaced one) is left out with its spans, as the guessed poles and the high-voltage
+    towers are (powerlines.tile_lines); None: every mapped pole is drawn, as before.
     """
     if not everywhere and not _french_kit(pole_profile):
         return
@@ -232,11 +235,16 @@ def place(frame, box, layers, elev, props, wires, pole_profile, urban_fn=None, e
         # (everywhere: the game's own wooden pole, the one furniture.place guesses, at its own height for its wires)
         style = poleprofiles.STOCK if everywhere else _style(choose(key, *xy, float(z[k])), tags, height)
         pole = (*map(float, xy), float(z[k]), yaw.get(key, 0.), style)
+        row = [style.group, round(pole[0], 2), round(pole[1], 2), round(pole[2], 2),
+               round(pole[3], 1), 1., style.height, 0.]
+        if clearance is not None and not clearance.clear(row):
+            continue                    # (in a carriageway: neither the pole nor the spans to it)
         poles[key] = pole
         if furniture._owns(box, *xy):
-            props.append([style.group, round(pole[0], 2), round(pole[1], 2), round(pole[2], 2),
-                          round(pole[3], 1), 1., style.height, 0.])
+            props.append(row)
     for a, b in sorted(spans):
+        if a not in poles or b not in poles:
+            continue
         # Stable source-id ownership, including reversed/repeated line geometry.
         pa, pb = poles[a], poles[b]
         if not furniture._owns(box, pa[0], pa[1]):
@@ -263,15 +271,16 @@ def _layers(md, frame, tx, ty, margin=MARGIN_M):
             for k in roads.cells_of_tile(frame, tx, ty, margin=margin)]
 
 
-def tile_poles(frame, tx, ty, md, elev, props, wires, pole_profile, urban_fn=None):
+def tile_poles(frame, tx, ty, md, elev, props, wires, pole_profile, urban_fn=None, clearance=None):
     if md is None or not (EVERYWHERE or _french_kit(pole_profile)):
         return
     import roads
     layers = _layers(md, frame, tx, ty, EVERYWHERE_MAX_SPAN_M + 5. if EVERYWHERE else MARGIN_M)
     if _french_kit(pole_profile):
-        place(frame, roads.tile_bbox(tx, ty), layers, elev, props, wires, pole_profile, urban_fn)
+        place(frame, roads.tile_bbox(tx, ty), layers, elev, props, wires, pole_profile, urban_fn, clearance=clearance)
     if EVERYWHERE:
-        place(frame, roads.tile_bbox(tx, ty), layers, elev, props, wires, pole_profile, everywhere=True)
+        place(frame, roads.tile_bbox(tx, ty), layers, elev, props, wires, pole_profile, everywhere=True,
+              clearance=clearance)
 
 
 def road_points(md, frame, tx, ty, pole_profile=None):
