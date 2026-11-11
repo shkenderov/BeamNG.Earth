@@ -7,9 +7,14 @@ inside the box: blank tiles) the next source fills in, down to NAIP, USGS and Se
 Kinds: XYZ caches ({z}/{x}/{y}; {ty} is the TMS row 2^z - 1 - y), and WMS / ArcGIS export services (export=2: one
 1024 px request per z15 parent, split into z17 tiles; lazy: fetched ahead of the player by warm(), as md6in).
 """
+import os
 
 WMS = ("SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&STYLES=&CRS=EPSG:3857&BBOX={bbox}&WIDTH={size}&HEIGHT={size}"
        "&FORMAT=image/jpeg")
+# a WMS that answers neither Web Mercator nor EPSG:4326 but CRS:84: the tile's extent longitude first
+# (imagery.lon_lat_bbox); outside its raster black (BGCOLOR), as the exports' no-data rule takes it
+WMS_CRS84 = ("SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&STYLES=&CRS=CRS:84&BBOX={bbox84}&WIDTH={size}&HEIGHT={size}"
+             "&FORMAT=image/jpeg&BGCOLOR=0x000000")
 ARCGIS_EXPORT = "bbox={bbox}&bboxSR=3857&imageSR=3857&size={size},{size}&format=jpg&f=image"
 # a WMS without Web Mercator: the tile's extent in latitude / longitude (imagery.lat_lon_bbox)
 WMS_4326 = ("SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&STYLES=&CRS=EPSG:4326&BBOX={bbox4326}&WIDTH={size}&HEIGHT={size}"
@@ -30,7 +35,7 @@ PLACE = {
     "poland": "Poland", "czechia": "Czechia", "estonia": "Estonia", "flanders": "Flanders (Belgium)",
     "de_bayern": "Bavaria", "de_nrw": "North Rhine-Westphalia", "de_bw": "Baden-Wurttemberg",
     "de_nds": "Lower Saxony", "de_berlin": "Berlin", "de_hessen": "Hesse", "japan": "Japan",
-    "au_nsw": "New South Wales", "au_tas": "Tasmania", "ontario": "Ontario",
+    "au_nsw": "New South Wales", "au_tas": "Tasmania", "ontario": "Ontario", "bg_sofia": "Sofia",
 }
 
 # name: (url, attribution, (south, west, north, east), kind, leaf_off)
@@ -128,3 +133,24 @@ REGIONAL = {
                 "GEO_Imagery_Data_Service_2018to2022/ImageServer/exportImage?" + ARCGIS_EXPORT,
                 "Ontario GEO imagery (Open Government Licence - Ontario)", (41.7, -95.2, 56.9, -74.3), "export", False),
 }
+
+# Sofia (the player, 2026-11-10): GIS-Sofia's 2024 orthophoto of Sofia Municipality, open data since 2026-09
+# (urbandata.sofia.bg/dataset/ortophoto_sf_2024, "Creative Commons Attribution", no version stated). A WMS on plain
+# http (its port 443 answers for another site), one layer; its capabilities list EPSG:7801 alone and it refuses
+# EPSG:3857 and EPSG:4326, but answers CRS:84 (probed 2026-11-10: 1024 px in ~1.5 s, 4 requests at once without an
+# error). The photo covers lat 42.5435-42.8698, lon 23.048-23.631 (about 910 km2: not upper Vitosha nor the
+# municipality's south-east), less than the capabilities' box; outside it the next source fills in. Opt-in
+# (BNE_SOFIA_ORTHO=on): a single municipal server with no published limits, and the entry also switches on the roofs'
+# and the pavings' colours from the photo inside its box (buildings.py, streetfront.py).
+SOFIA_ORTHO_ENV = "BNE_SOFIA_ORTHO"
+SOFIA_ORTHO = ("http://nospire.gis-sofia.bg/open_wms?LAYERS=aerophoto_2024&" + WMS_CRS84,
+               "GIS-Sofia EOOD orthophoto 2024 (CC BY)", (42.54, 23.04, 42.875, 23.635), "export", False)
+# The in-game map shows these export sources from this zoom on, fetched by the map itself (imagery.Source.map_min_zoom;
+# the player, 2026-11-11: the Sofia photo should "come in the nav sooner", it showed from z17, where the car had
+# been). name: (from this zoom, the zoom whose scale the host draws sharply: wider tiles are asked larger and
+# reduced). Sofia from z12 (~28 m a pixel: the whole municipality in one view; wider views keep the one consistent
+# satellite picture); its server's coarse overviews are blurred (blocks of ~100 m at z12's scale, ~50 m at z13's,
+# worse than Sentinel-2's 10 m; sharp at z14's: looked at 2026-11-11), so z12 asks 1024 px and z13 512 px.
+MAP_MIN_ZOOM = {"bg_sofia": (12, 14)}
+if os.environ.get(SOFIA_ORTHO_ENV, "").strip().lower() in ("1", "on", "true"):
+    REGIONAL["bg_sofia"] = SOFIA_ORTHO

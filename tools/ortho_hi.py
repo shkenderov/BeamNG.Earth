@@ -60,7 +60,8 @@ def fetch(f, name, x0, y0, x1, y1, px):
     if kind == "export":
         (s, w), (n_, e) = unmerc(x0, y0), unmerc(x1, y1)
         try:
-            r = f.get(url.format(bbox=f"{x0},{y0},{x1},{y1}", bbox4326=f"{s},{w},{n_},{e}", w=px, h=px, size=px))
+            r = f.get(url.format(bbox=f"{x0},{y0},{x1},{y1}", bbox4326=f"{s},{w},{n_},{e}",
+                                 bbox84=f"{w},{s},{e},{n_}", w=px, h=px, size=px))
             img = Image.open(io.BytesIO(r.body)).convert("RGB")
         except Exception as ex:
             print(name, "failed:", ex)

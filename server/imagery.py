@@ -357,6 +357,13 @@ def lat_lon_bbox(mb):
     return f"{lat(y0):.7f},{lon(x0):.7f},{lat(y1):.7f},{lon(x1):.7f}"
 
 
+def lon_lat_bbox(mb):
+    """An EPSG:3857 extent as CRS:84's BBOX: "west,south,east,north" (longitude first; lat_lon_bbox's numbers). For a
+    WMS that answers neither Web Mercator nor EPSG:4326 (GIS-Sofia's orthophoto, imagery_regional.SOFIA_ORTHO)."""
+    s, w, n, e = lat_lon_bbox(mb).split(",")
+    return f"{w},{s},{e},{n}"
+
+
 def mercator_bbox(z, x, y):
     """EPSG:3857 extent (minx, miny, maxx, maxy) of XYZ tile (z, x, y)."""
     size = EARTH_CIRC / 2 ** z
@@ -715,7 +722,8 @@ class Imagery:
             mb = mercator_bbox(z - k, x >> k, y >> k)
             if src.url == bcorthomod.URL:
                 return self._render_bcortho(src, z, x, y, mb)
-            url = src.url.format(bbox=",".join(f"{v:.3f}" for v in mb), bbox4326=lat_lon_bbox(mb), size=TILE << k)
+            url = src.url.format(bbox=",".join(f"{v:.3f}" for v in mb), bbox4326=lat_lon_bbox(mb),
+                                 bbox84=lon_lat_bbox(mb), size=TILE << k)
             if self.fetcher.miss_alive(miss, url):
                 return None
             kind = getattr(self._local, "kind", "demand")
