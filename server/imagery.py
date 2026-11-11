@@ -85,6 +85,7 @@ POLAR_RGB = (226, 232, 240)        # ... past Web Mercator's limit, where it is 
 BLANK_RANGE = 2                    # a tile whose pixels all lie within this many levels is uniform
 SEA_RGB, SEA_TOL = (24, 44, 78), 3  # ... unless it is this colour: EOX cloudless' open sea (2023 and 2016 alike), data
 NODATA_MAX, NODATA_SHARE = 6, 0.02   # an export tile with > 2 % texels this black is outside the data
+MAP_EXPORT_MAX = 1024              # px: the largest image map_export asks for (an export parent's size)
 NODATA_BLOCK = 8                   # px: inside a tile, a square this size all this black is outside the data
 NODATA_EDGE = 2                    # ... and this much round it (the JPEG's grey fringe on the black)
 NODATA_WHITE_MIN, NODATA_WHITE_SHARE = 250, 0.25   # ... or (nodata "white") > 25 % this white: white roofs
@@ -129,6 +130,13 @@ class Source:
     # Never used for a view finer than this zoom (not enlarged: the next source's sharper tiles there), unlike
     # max_zoom, which a finer view uses enlarged
     max_view_zoom: int = 99
+    # The in-game map (maptiles.py) asks an export source itself from this zoom on, one 256 px image per map tile
+    # (Imagery.map_export), instead of showing only the z17 tiles warm() left on disk. 0: not (the map shows it from
+    # min_zoom, where the player has driven).
+    map_min_zoom: int = 0
+    # ... and below this zoom it asks for a larger image (this zoom's scale, at most MAP_EXPORT_MAX px) and reduces
+    # it: a host whose coarse overviews are blurred (GIS-Sofia's: blocks of ~50 m at z13's scale, sharp at z14's)
+    map_sharp_zoom: int = 0
 
 
 SOURCES = {
@@ -192,7 +200,8 @@ for _n, (_url, _attr, _bounds, _kind, _leaf) in imagery_regional.REGIONAL.items(
                              leaf_off=_leaf)
     else:                       # a WMS / ArcGIS export: one 1024 px image per z15 parent, ahead of the player
         SOURCES[_n] = Source(_n, _url, 17, _attr, min_zoom=17, export=2, lazy=True, bounds=_bounds, nodata="white",
-                             leaf_off=_leaf)
+                             leaf_off=_leaf, map_min_zoom=imagery_regional.MAP_MIN_ZOOM.get(_n, (0, 0))[0],
+                             map_sharp_zoom=imagery_regional.MAP_MIN_ZOOM.get(_n, (0, 0))[1])
 # British Columbia's lidar-programme orthophotos (bcortho.py: 10-15 cm, rendered from the Province's GeoTIFFs, not
 # fetched as images): after the regional services, like an export source
 SOURCES["bcortho"] = Source("bcortho", bcorthomod.URL, 17, bcorthomod.ATTRIBUTION, min_zoom=17, export=2, lazy=True,
@@ -813,6 +822,33 @@ class Imagery:
                 if (cx, cy) == (x, y):
                     out = b
         return out
+
+    def map_export(self, src, z, x, y, kind="demand"):
+        """An export source's picture of map tile (z, x, y) itself, RGB (TILE, TILE, 3) uint8, for the in-game map
+        (maptiles.py: sources with map_min_zoom): one small request of the tile's own extent, at any zoom (a WMS
+        draws any scale), not split or kept here (the map keeps its tiles as files). Below the source's
+        map_sharp_zoom the image is asked larger and reduced. None where the host has no image (404). Raises
+        ImageryError when the fetch failed."""
+        mb = mercator_bbox(z, x, y)
+        size = min(MAP_EXPORT_MAX, TILE << max(0, src.map_sharp_zoom - z))
+        url = src.url.format(bbox=",".join(f"{v:.3f}" for v in mb), bbox4326=lat_lon_bbox(mb),
+                             bbox84=lon_lat_bbox(mb), size=size)
+        try:
+            r = self.fetcher.get(url, kind=kind)
+        except netfetch.NotFound:
+            self._count(src.name + ":404")
+            return None
+        except netfetch.FetchError as e:
+            self._count(src.name + ":error")
+            raise ImageryError(f"imagery fetch failed: {url}: {e}", unavailable=isinstance(e, netfetch.HostUnavailable)) from None
+        try:
+            im = Image.open(io.BytesIO(r.body)).convert("RGB")
+        except (OSError, ValueError) as e:
+            raise ImageryError(f"undecodable {src.name} map image {(z, x, y)}: {e}") from None
+        if im.size != (TILE, TILE):
+            im = im.resize((TILE, TILE), Image.BOX if im.size[0] > TILE else Image.BILINEAR)
+        self._count(src.name + ":map")
+        return np.asarray(im)
 
     def raw(self, src, z, x, y, kind="demand"):
         """A source tile's bytes as served (disk cache, else the network; in the calling thread), None where the

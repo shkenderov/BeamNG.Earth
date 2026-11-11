@@ -198,6 +198,12 @@ def layer_image(data, layer, dz, x, y):
     return encode_png(a) if png else encode_jpeg(a)
 
 
+def _direct(src, z):
+    """Does the map ask source src for a zoom-z tile itself (an export source with map_min_zoom, from that zoom)?"""
+    m = getattr(src, "map_min_zoom", 0)
+    return bool(m) and z >= m
+
+
 class MapTiles:
     """Map tiles from an imagery.Imagery (or anything with .chain, .tiles(keys, kind) and
     .attribution())."""
@@ -210,15 +216,48 @@ class MapTiles:
     def order(self, z):
         chain = list(self.imagery.chain)
         if z <= EOX_FIRST_MAX_Z:
-            chain.sort(key=lambda s: 0 if s.name.startswith("eox") else 1)     # stable: chain order kept
+            # stable: chain order kept (a source the map asks itself at this zoom stays ahead: _direct)
+            chain.sort(key=lambda s: 0 if s.name.startswith("eox") or _direct(s, z) else 1)
         return chain
 
     def tile(self, z, x, y):
         """(jpeg bytes, source name), or None where no source has imagery. Raises
         imagery.ImageryError when a fetch failed (and no later source had the tile)."""
         z, x, y = check_tile(z, x, y)
+        got = self._rgb(z, x, y, self.order(z))
+        return None if got is None else (encode_jpeg(got[0]), got[1])
+
+    def _rgb(self, z, x, y, chain):
+        """tile()'s picture from the sources of chain in order: (RGB, source name), or None."""
         err = None
-        for src in self.order(z):
+        for i, src in enumerate(chain):
+            if _direct(src, z):
+                # an export source the map asks itself (imagery.Source.map_min_zoom): the tile's own extent; where
+                # the photo ends inside the tile (black past its edge) the next sources' picture shows
+                if not imagerymod.in_bounds(src, z, x, y):
+                    continue
+                try:
+                    rgb = self.imagery.map_export(src, z, x, y, self.kind)
+                except imagerymod.ImageryError as e:
+                    err = e
+                    continue
+                if rgb is None or imagerymod.is_uniform(rgb):
+                    continue
+                hole = imagerymod.nodata_mask(rgb)
+                if src.nodata == "white":       # (a service that paints white where its raster has no photo)
+                    white = imagerymod.nodata_mask(255 - rgb)
+                    if white is not None:
+                        hole = white if hole is None else hole | white
+                if hole is not None:
+                    if hole.all():
+                        continue
+                    try:
+                        under = self._rgb(z, x, y, chain[i + 1:])
+                    except imagerymod.ImageryError:
+                        under = None
+                    if under is not None:
+                        rgb = np.where(hole[..., None], under[0], rgb)
+                return rgb, src.name
             if z < src.min_zoom:
                 continue
             sz = min(z, src.max_zoom)
@@ -233,7 +272,7 @@ class MapTiles:
                 continue
             if t is None or t.uniform:
                 continue
-            return encode_jpeg(crop_up(t.rgb, dz, x, y)), src.name
+            return crop_up(t.rgb, dz, x, y), src.name
         if err is not None:
             raise err
         return None

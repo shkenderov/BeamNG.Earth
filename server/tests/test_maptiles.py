@@ -110,6 +110,46 @@ class MapTilesTest(unittest.TestCase):
         with self.assertRaises(imagery.ImageryError):
             maptiles.MapTiles(FakeImagery(fail=("usgs", "eox2023", "eox2016"))).tile(15, 9412, 12490)
 
+    def test_export_source_asked_by_the_map_itself(self):
+        # a source with map_min_zoom: its own picture of the tile from that zoom (ahead of EOX's low-zoom rule), the
+        # next source's picture where the photo ends inside the tile, the next source where it has nothing
+        import dataclasses
+        src = dataclasses.replace(S["de_berlin"], map_min_zoom=12)
+        z, x, y = 12, 2200, 1343                    # Berlin
+        photo = np.zeros((256, 256, 3), np.uint8)
+        photo[..., 2] = 90
+        photo[..., 1] = np.arange(256, dtype=np.uint8)[None, :] // 2
+        photo[:, 128:] = 0                          # black past the photo's edge: the tile's east half
+
+        class Img(FakeImagery):
+            def __init__(self, got, **kw):
+                super().__init__(chain=("usgs", "eox2023"), **kw)
+                self.chain = (src,) + self.chain
+                self.got, self.asked = got, []
+
+            def map_export(self, s, z, x, y, kind="demand"):
+                self.asked.append((s.name, z, x, y, kind))
+                if isinstance(self.got, Exception):
+                    raise self.got
+                return self.got
+
+        img = Img(photo)
+        jpeg, name = maptiles.MapTiles(img).tile(z, x, y)
+        self.assertEqual(name, "de_berlin")
+        self.assertEqual(img.asked, [("de_berlin", z, x, y, maptiles.FETCH_KIND)])
+        a = decode(jpeg)
+        self.assertLess(abs(a[100, 40, 2] - 90), 12)                # the photo in the west half
+        self.assertLess(abs(a[100, 220, 0] - 140), 12)              # EOX (first at z12) under its black half
+        self.assertEqual(maptiles.MapTiles(Img(photo)).tile(11, x >> 1, y >> 1)[1], "eox2023")      # below its zoom
+        img = Img(photo)
+        self.assertEqual(maptiles.MapTiles(img).tile(z, 100, 100)[1], "eox2023")                    # outside its box
+        self.assertEqual(img.asked, [])
+        for nothing in (None, np.zeros((256, 256, 3), np.uint8), imagery.ImageryError("down")):
+            self.assertEqual(maptiles.MapTiles(Img(nothing)).tile(z, x, y)[1], "eox2023")
+        with self.assertRaises(imagery.ImageryError):
+            maptiles.MapTiles(Img(imagery.ImageryError("down"), fail=("usgs", "eox2023"))).tile(z, x, y)
+        self.assertEqual(maptiles.MapTiles(Img(photo)).tile(17, x << 5, y << 5)[1], "de_berlin")    # and at z17
+
     def test_overzoom_crops_the_ancestor(self):
         img = FakeImagery(chain=("eox2023",))
         t = maptiles.MapTiles(img)
