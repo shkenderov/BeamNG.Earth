@@ -86,6 +86,23 @@ LINE_CELLS = 1              # stream / river lines from the 3 x 3 cells around: 
                             # first visit (~50 for one road tile in a Pennsylvania town, 2026-10-27)
 LINE_STEP_PX = 4            # a level every 4 px (~7.5 m) along them
 LINE_PROBE_MAX_M = 15.0     # the level: the lowest DEM within half the width, at most this far
+# On a fine terrain model (dem.Dem.fine_at: Sofia's 1 m) the stream's own channel is in the ground, a cut a few metres
+# wide and deep, and the mapped line is often 5-15 m beside it: the probes above met the bank or the street, the level
+# was the street's and the water's ribbon hung metres over the real bed (the player, 2026-11-11: "the water levels are
+# totally wrong. They are way higher than the river beds"; replayed: the surface a median 4 m, up to 11 m, over the
+# lowest ground across the ribbon in central Sofia). There the ground is read across the line (SNAP_STEP_M apart, to
+# SNAP_MAX_M either side), the sample moves into the channel it finds (the point deepest below the lower of the
+# highest ground on its two sides, by SNAP_MIN_M at least; nearer ones preferred, SNAP_FAR a metre) and the level is
+# the lowest ground within the half width there. A sample whose water still stands more than FLAG_GAP_M over the
+# lowest ground under its ribbon (half width + bank) is flagged (SeaCarver.flags, one log line a cell): a side slope,
+# a weir, a line through a cutting.
+SNAP_MAX_M = 15.0
+SNAP_STEP_M = 1.5
+SNAP_MIN_M = 0.5
+SNAP_FAR = 0.02
+SNAP_VERSION = 1            # in the cache folder of the cells a fine model reaches (_path)
+FLAG_GAP_M = 2.0
+FLAGS_KEPT = 2000
 LINE_DEPTH_M = (0.6, 3.0)   # the bed's depth in the middle: width / 6, clamped
 LINE_BANK_M = 4.0           # the bank beyond the half width ...
 LINE_BANK_SLOPE = 1.0       # ... kept below level + its distance (1:1)
@@ -336,6 +353,7 @@ class SeaCarver:
         self._warm, self._warm_thread = [], None    # cells to build in the background (warm)
         self.warm_asked = 0             # warm() calls with cells: a lookup met a cell not at hand (earthd's water plans)
         self._warm_cv = threading.Condition()
+        self.flags = []                 # (lat, lon, level, gap m): water left high over its ground (FLAG_GAP_M)
 
     # --- rasters --------------------------------------------------------------------------------
     def _water(self, key):
@@ -455,6 +473,12 @@ class SeaCarver:
     def _path(self, x, y):
         rel = getattr(self.md, "release", "x")
         lakes = "lakes" if self.dem is not None else "sea"
+        # (the cells a fine terrain model reaches: their levels follow it, in a folder of their own, not the ones made
+        # without it or before its channels were read)
+        tag = getattr(self.dem, "fine_tag", None)
+        tag = tag(mapcells.ZOOM, x, y) if tag is not None else ""
+        if tag:
+            lakes += f"-{tag}-s{SNAP_VERSION}"
         return os.path.join(self.dir, str(rel), lakes, str(x), f"{y}.npz") if self.dir else None
 
     def _load(self, x, y, with_bathy=True):
@@ -713,6 +737,14 @@ class SeaCarver:
                 runs.extend((q, kind) for q in self._line_runs(np.stack([mx - ox, my - oy], -1), n, px))
         # every run's DEM probes in one sample (its tiles fetched at once): a run at a time was a network round trip
         # each, ~40 s of a fresh place's first block on a slow line (Ostrava, a Windows PC on Wi-Fi, 2026-10-28)
+        low = [None] * len(runs)        # per run: the channel's ground on a fine terrain model (NaN: the probes')
+        fine_at = getattr(self.dem, "fine_at", None)
+        if fine_at is not None and runs:
+            try:
+                runs, low, flagged = self._snap_runs(runs, px, ox, oy, fine_at)
+                self._flag(x, y, flagged)
+            except Exception as ex:     # (the lines as mapped)
+                log.debug("stream channels: %s", ex)
         probes = [self._run_probes(q, kind, n, px, o_dist, ox, oy) for q, kind in runs]
         if probes:
             la = np.concatenate([p[1] for p in probes])
@@ -723,11 +755,13 @@ class SeaCarver:
                 log.debug("stream levels: %s", ex)
                 e_all = None
             k = 0
-            for (q, _kind), (w, pla, _plo) in zip(runs, probes):
+            for ri, ((q, _kind), (w, pla, _plo)) in enumerate(zip(runs, probes)):
                 m = len(pla)
                 if e_all is not None:
-                    self._carve_run(q, w, e_all[k:k + m].reshape(9, -1).min(axis=0), n, px, depth, level, held,
-                                    drawn)
+                    e = e_all[k:k + m].reshape(9, -1).min(axis=0)
+                    if low[ri] is not None:
+                        e = np.fmin(e, low[ri])
+                    self._carve_run(q, w, e, n, px, depth, level, held, drawn)
                 k += m
         outline |= drawn
 
@@ -790,6 +824,77 @@ class SeaCarver:
         keep[1:] |= near[:-1]
         runs = np.flatnonzero(np.diff(np.r_[0, keep.astype(np.int8), 0]))
         return [q[a:b] for a, b in zip(runs[::2], runs[1::2]) if b - a >= 2]
+
+    def _snap_runs(self, runs, px, ox, oy, fine_at):
+        """The runs moved into their channels where the terrain model is fine (SNAP_*): (runs, low, flagged); low: per
+        run its samples' lowest ground within the half width (NaN where the model is not fine), or None (a run with
+        no fine sample: untouched); flagged: [(lat, lon, level, gap m)] of the samples left high over their ground.
+        A sample's answer is its own (its line's direction there, the ground across it): the same from every cell."""
+        import riverlines
+        K = int(round(SNAP_MAX_M / SNAP_STEP_M))
+        off_m = np.arange(-K, K + 1) * SNAP_STEP_M              # across the line, metres
+        geo = []
+        for q, kind in runs:
+            d = np.gradient(q, axis=0) if len(q) >= 2 else np.zeros_like(q)
+            ln = np.hypot(d[:, 0], d[:, 1])
+            nrm = np.stack([-d[:, 1], d[:, 0]], -1) / np.maximum(ln, 1e-9)[:, None]
+            la, lo = _lonlat(ox + q[:, 0] + 0.5, oy + q[:, 1] + 0.5)
+            fine = np.asarray(fine_at(la, lo), bool) & (ln > 0)
+            geo.append((nrm, fine))
+        if not any(f.any() for _, f in geo):
+            return runs, [None] * len(runs), []
+        pla, plo = [], []
+        for (q, _kind), (nrm, fine) in zip(runs, geo):
+            if fine.any():
+                p = q[fine][None, :, :] + (off_m / px)[:, None, None] * nrm[fine][None, :, :]
+                la, lo = _lonlat(ox + p[..., 0] + 0.5, oy + p[..., 1] + 0.5)
+                pla.append(la.ravel())
+                plo.append(lo.ravel())
+        e_all = np.asarray(self.dem.sample(np.concatenate(pla), np.concatenate(plo), LAKE_DEM_ZOOM), np.float64)
+        out, low, flagged, k = [], [], [], 0
+        for (q, kind), (nrm, fine) in zip(runs, geo):
+            if not fine.any():
+                out.append((q, kind))
+                low.append(None)
+                continue
+            m = int(fine.sum())
+            e = e_all[k:k + (2 * K + 1) * m].reshape(2 * K + 1, m)
+            k += (2 * K + 1) * m
+            # how far each point lies below the lower of the highest ground on its two sides (a channel's depth)
+            left = np.vstack([np.full((1, m), -np.inf), np.maximum.accumulate(e, axis=0)[:-1]])
+            right = np.vstack([np.maximum.accumulate(e[::-1], axis=0)[::-1][1:], np.full((1, m), -np.inf)])
+            prom = np.minimum(left, right) - e
+            best = np.argmax(np.where(np.isfinite(prom), prom - SNAP_FAR * np.abs(off_m)[:, None], -np.inf), axis=0)
+            cols = np.arange(m)
+            snap = prom[best, cols] >= SNAP_MIN_M
+            best = np.where(snap, best, K)
+            hw = max(riverlines.WIDTH_M[kind] / 2, SNAP_STEP_M)
+            dist = np.abs(off_m[:, None] - off_m[best][None, :])
+            lo_e = np.where(dist <= hw, e, np.inf).min(axis=0)
+            under = np.where(dist <= hw + LINE_BANK_M, e, np.inf).min(axis=0)
+            gap = np.round(lo_e / LEVEL_Q) * LEVEL_Q - under
+            q2 = q.copy()
+            q2[fine] = q[fine] + (off_m[best] / px)[:, None] * nrm[fine]
+            lw = np.full(len(q), np.nan)
+            lw[fine] = lo_e
+            out.append((q2, kind))
+            low.append(lw)
+            bad = np.flatnonzero(gap > FLAG_GAP_M)
+            if len(bad):
+                la, lo = _lonlat(ox + q2[fine][bad, 0] + 0.5, oy + q2[fine][bad, 1] + 0.5)
+                flagged += [(float(a), float(b), float(c), float(g)) for a, b, c, g in zip(la, lo, lo_e[bad], gap[bad])]
+        return out, low, flagged
+
+    def _flag(self, x, y, flagged):
+        """The samples of cell (x, y)'s lines whose water stands high over its ground, kept (flags) and said once."""
+        if not flagged:
+            return
+        with self._lock:
+            self.flags = (self.flags + flagged)[-FLAGS_KEPT:]
+        w = max(flagged, key=lambda f: f[3])
+        log.info("water: cell %d/%d: %d stream samples stand more than %.1f m over the ground under them (the worst "
+                 "%.1f m at %.5f, %.5f): a side slope, a weir or a line beside its channel", x, y, len(flagged),
+                 FLAG_GAP_M, w[3], w[0], w[1])
 
     def _run_probes(self, q, kind, n, px, o_dist, ox, oy):
         """(w, la, lo): a run's widths (m) and its DEM probes (the point and 8 around it at half the width,

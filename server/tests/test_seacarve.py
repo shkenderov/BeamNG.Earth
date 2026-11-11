@@ -654,5 +654,66 @@ class UndergroundLinesTest(unittest.TestCase):
         self.assertTrue(riverlines.underground(Lines(), 1))
 
 
+class ChannelTest(unittest.TestCase):
+    """On a fine terrain model a stream line moves into the channel in the ground beside it, its level the bed's;
+    water left high over its ground is flagged (seacarve.SNAP_*, FLAG_GAP_M)."""
+    PX = 1.4                    # m a raster pixel
+    OX, OY = 9_500_000, 6_200_000
+
+    class Dem:
+        """ground(east m of the raster's pixel 500) on the raster's grid; fine everywhere (or nowhere)."""
+
+        def __init__(self, ground, fine=True):
+            self.ground, self.fine = ground, fine
+
+        def sample(self, lat, lon, zoom, progress=None):
+            mx, _ = seacarve._merc(lat, lon)
+            return self.ground((mx - ChannelTest.OX - 0.5 - 500.0) * ChannelTest.PX)
+
+        def fine_at(self, lat, lon):
+            return np.full(np.shape(lat), self.fine)
+
+    def run_line(self, ground, fine=True):
+        sc = seacarve.SeaCarver(None, None, dem=self.Dem(ground, fine))
+        q = np.stack([np.full(40, 500.0), 100.0 + 5.0 * np.arange(40)], -1)        # a line along the rows
+        runs, low, flagged = sc._snap_runs([(q, "stream")], self.PX, self.OX, self.OY, sc.dem.fine_at)
+        return q, runs[0][0], low[0], flagged
+
+    def test_line_moves_into_the_channel_beside_it(self):
+        # flat ground at 100 m, a 4.4 m channel 4 m deep whose middle is 8 m east of the mapped line
+        q, q2, low, flagged = self.run_line(lambda e: np.where(np.abs(e - 8.0) < 2.2, 96.0, 100.0))
+        shift = (q2[:, 0] - q[:, 0]) * self.PX
+        self.assertTrue((np.abs(shift - 8.0) < 2.2).all(), shift)
+        np.testing.assert_array_equal(q2[:, 1], q[:, 1])
+        np.testing.assert_allclose(low, 96.0)
+        self.assertEqual(flagged, [])
+
+    def test_not_on_a_coarse_model(self):
+        q, q2, low, flagged = self.run_line(lambda e: np.where(np.abs(e - 8.0) < 2.2, 96.0, 100.0), fine=False)
+        np.testing.assert_array_equal(q2, q)
+        self.assertIsNone(low)
+        self.assertEqual(flagged, [])
+
+    def test_side_slope_stays_and_is_flagged(self):
+        # no channel, the ground falling 0.5 m a metre across the line: the line stays, its level the lowest ground
+        # within its half width (2 m), and the ribbon's far edge (6 m) is over 2 m below it
+        q, q2, low, flagged = self.run_line(lambda e: 100.0 - 0.5 * e)
+        np.testing.assert_allclose(q2, q)
+        np.testing.assert_allclose(low, 99.25)
+        self.assertEqual(len(flagged), len(q))
+        self.assertTrue(all(2.0 < f[3] < 2.6 for f in flagged), flagged[:3])
+
+    def test_fine_cells_have_a_cache_folder_of_their_own(self):
+        class MD:
+            release = "r"
+
+        class Dem:
+            def fine_tag(self, z, x, y):
+                return "sofia1-ab" if x == 5 else ""
+        sc = seacarve.SeaCarver(MD(), "c", dem=Dem())
+        self.assertIn(os.path.join("lakes-sofia1-ab-s%d" % seacarve.SNAP_VERSION, "5"), sc._path(5, 7))
+        self.assertIn(os.path.join("lakes", "6"), sc._path(6, 7))
+
+
 if __name__ == "__main__":
     unittest.main()
