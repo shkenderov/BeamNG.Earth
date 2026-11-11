@@ -46,6 +46,8 @@ For the OpenStreetMap keys read by the server and weekly data builders, see the
 | AWS Terrain Tiles (backup) | `s3.amazonaws.com` | Coarser heights (SRTM and similar) where Mapterhorn has none or does not answer. | Only matters while Mapterhorn is down too; with both down, new places have no terrain. | named |
 | Copernicus DEM GLO-30 | `copernicus-dem-30m.s3.amazonaws.com` | Heights near the North and South Poles, where the other sources stop. | No terrain past about 85° north or south. | named |
 | NRCan HRDEM mosaic (CanElevation) | `canelevation-dem.s3.ca-central-1.amazonaws.com` | Canada's lidar ground heights: the distant terrain is lined up with them (and, opt-in, the near terrain read from them). | Canada's distant terrain may stand on the forest tops. | optional |
+| Sofiaplan terrain model (Sofia Municipality, DTM SO 2024) | none: a file on your PC, named in `BNE_SOFIA_DTM` (downloaded by hand from `sofiaplan.bg/api`, dataset 656) | Sofia's ground heights at 1 m, from the city's own contour map: smooth streets, road cuttings, embankments and underpass ramps. | Without the file Sofia stands on the 30 m global heights. | no runtime host |
+| GIS-Sofia streets and sidewalks (Sofia Municipality, 2026-08) | none: a file on your PC, named in `BNE_SOFIA_STREETS` (downloaded by hand from `urbandata.sofia.bg`, dataset streets_curbs) | Sofia's carriageways as surveyed: each road's real width instead of a guess, sidewalks on the sides that have one, no lamps or poles on a carriageway. | Without the file Sofia's roads keep their guessed widths. | no runtime host |
 | USGS 3DEP lidar point clouds | `s3-us-west-2.amazonaws.com` | In the US, the real height of bridge decks, measured along each bridge from the lidar points (about 13 MB per map cell full of bridges, once). Off with `BNE_LIDAR_DECKS=off`. | Bridge decks get the estimated heights. | optional |
 | NVDB (Statens vegvesen) | `nvdbapiles.atlas.vegvesen.no` | In Norway, the measured heights of bridges and tunnels (and roads where the terrain is coarse). Off with `BNE_ROADZ=off`. | Estimated heights. | optional |
 | 3DBAG (TU Delft 3D geoinformation, 3DGI) | `data.3dbag.nl` | In the Netherlands, each building's measured roof shape, heights and ridge direction (the WFS layer BAG3D:lod22, a request per 250 m square, kept on disk). Off with `BNE_3DBAG=off`. | Predicted roofs. | optional |
@@ -80,7 +82,7 @@ Pennsylvania (`imagery.pasda.psu.edu`), Virginia (`vginmaps.vdem.virginia.gov`),
 (`geo.api.vlaanderen.be`), Bavaria (`geoservices.bayern.de`), North Rhine-Westphalia (`www.wms.nrw.de`),
 Baden-Wurttemberg (`owsproxy.lgl-bw.de`), Lower Saxony (`opendata.lgln.niedersachsen.de`), Berlin
 (`gdi.berlin.de`), Hesse (`www.gds-srv.hessen.de`), Japan (`cyberjapandata.gsi.go.jp`), New South Wales
-(`maps.six.nsw.gov.au`), Tasmania (`services.thelist.tas.gov.au`) and Ontario (`ws.geoservices.lrc.gov.on.ca`).
+(`maps.six.nsw.gov.au`), Tasmania (`services.thelist.tas.gov.au`), Ontario (`ws.geoservices.lrc.gov.on.ca`) and, opt-in with `BNE_SOFIA_ORTHO=on`, Sofia (`nospire.gis-sofia.bg`, plain http).
 
 ## Land cover, trees and water
 

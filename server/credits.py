@@ -73,6 +73,7 @@ ELEVATION = {
     "lidarbc": "Contains information licensed under the Open Government Licence - British Columbia (LidarBC)",
     "hrdem": "Contains information licensed under the Open Government Licence - Canada "
              "(Natural Resources Canada, HRDEM - CanElevation Series)",
+    "sofiaplan": "Sofiaplan, Sofia Municipality (terrain model DTM SO 2024, from GIS-Sofia's contours)",
     polardem.SOURCE: "Produced using Copernicus WorldDEM-30 (c) DLR e.V. 2010-2014 and (c) Airbus Defence and Space GmbH "
                      "2014-2018 provided under COPERNICUS by the European Union and ESA; all rights reserved",
 }
@@ -93,11 +94,11 @@ SHORT = {
     "img:flanders": "Digitaal Vlaanderen", "img:de_bayern": "LDBV Bayern", "img:de_nrw": "Geobasis NRW",
     "img:de_bw": "LGL BW", "img:de_nds": "LGLN", "img:de_berlin": "Geoportal Berlin", "img:de_hessen": "HVBG Hessen",
     "img:japan": "GSI Japan", "img:au_nsw": "Spatial Services NSW", "img:au_tas": "theLIST Tasmania",
-    "img:ontario": "Ontario GEO", "img:bcortho": "LidarBC photos (OGL-BC)",
+    "img:ontario": "Ontario GEO", "img:bcortho": "LidarBC photos (OGL-BC)", "img:bg_sofia": "GIS-Sofia",
     "img:bngs2": "ESA WorldCover Sentinel-2 2021 (Copernicus)",
     f"dem:{demmod.MAPTERHORN['name']}": "Mapterhorn", f"dem:{demmod.AWS['name']}": "AWS Terrain Tiles / Mapzen",
     f"dem:{polardem.SOURCE}": "Copernicus DEM (DLR, Airbus)",
-    "dem:hrdem": "NRCan HRDEM (OGL-Canada)", "dem:lidarbc": "LidarBC (OGL-BC)",
+    "dem:hrdem": "NRCan HRDEM (OGL-Canada)", "dem:lidarbc": "LidarBC (OGL-BC)", "dem:sofiaplan": "Sofiaplan",
     WEATHER_ID: "Open-Meteo",
 }
 # Every other source that built what is near the player (the user, 2026-10-18: "show all sources", not only those
@@ -114,6 +115,7 @@ FEATURES = {
     "roof:lod2-de": "German states' LoD2 roofs (GeoBasis-DE)",
     "roof:3dbag": "3DBAG (tudelft3d, 3DGI)",
     "bld:bdtopo-fr": "IGN BD TOPO",
+    "map:gis-sofia": "GIS-Sofia",
     "air:ourairports": "OurAirports", "grav:egm2008": "NGA EGM2008", "climate:beck-kg": "Beck et al. (Koppen-Geiger)",
 }
 # (the full wordings of features whose licences name each provider: hello.attribution / CREDITS.md)
@@ -122,6 +124,8 @@ LONG = {
                   "data changed",
     "bld:bdtopo-fr": "Building heights, storeys, materials and use: IGN, BD TOPO (Licence Ouverte / Etalab 2.0), "
                      "data changed",
+    "map:gis-sofia": "Carriageway widths and sidewalks in Sofia: GIS-Sofia EOOD, Sofia Municipality, "
+                     "\"Streets and sidewalks\" 2026-08 (CC BY), data changed",
     "roof:lod2-de": "Roof shapes and heights: changed data from the German states' LoD2 building models: "
                     "Datenquelle: LGL, www.lgl-bw.de, dl-de/by-2-0; Bayerische Vermessungsverwaltung - "
                     "www.geodaten.bayern.de (CC BY 4.0); Geoportal Berlin (dl-de/zero-2.0); GeoBasis-DE / LGB "
@@ -252,6 +256,15 @@ def feature_ids(conn):
                 ids.add("bridge:wikidata")
         except Exception:           # (the inventories are optional files)
             pass
+        try:                        # (Sofia's surveyed streets, sofiastreets.py: the roads' widths and sidewalks)
+            import sofiastreets
+            streets = sofiastreets.from_env()
+            if streets is not None:
+                south, west, north, east = streets.bounds
+                if south < lat < north and west < lon < east:
+                    ids.add("map:gis-sofia")
+        except Exception:
+            pass
         try:                        # (a measured German roof shard on disk near: lod2roofs)
             import lod2roofs
             src = getattr(md, "lod2_roofs", None)
@@ -335,6 +348,8 @@ def tile_sources(frame, bbox, dem, zoom, used):
                 ids.add("dem:hrdem")
             if k in getattr(dem, "lidarbc_served", ()):
                 ids.add("dem:lidarbc")
+            if k in getattr(dem, "sofia_served", ()):
+                ids.add("dem:sofiaplan")
     if callable(getattr(dem, "polar", None)) and polar_covered(frame, bbox, dem.polar()):
         ids.add(f"dem:{polardem.SOURCE}")
     return frozenset(ids)
