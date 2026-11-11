@@ -1133,6 +1133,16 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
         [(spec.width / 2, pts) for _, spec, pts, _ in roads], decks, bounds=box)
     import fast
     bed = fast.Others(list(obstacles)) if obstacles else None
+    # Sofia's surveyed streets (sofiastreets.py, BNE_SOFIA_STREETS; None without): no pole or lamp on a carriageway,
+    # a parking bay, a tram bed or a bike lane as the municipality drew them, whatever width the road was given here
+    import sofiastreets
+    streets = sofiastreets.from_env() if pole_frame is not None else None
+
+    def on_street(x, y):
+        if streets is None:
+            return False
+        lat, lon, _ = pole_frame.enu_to_geodetic(float(x), float(y), 0.0)
+        return bool(streets.blocked(float(lat), float(lon))[0])
 
     def on_bed(q):              # is q on (or by) an obstacle's ground?
         return bed is not None and not bed.clear(np.array([q[0], q[1]]), None, CLEAR_OTHER_M)
@@ -1200,7 +1210,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                     pole_style = pole_at(fid, float(q[0]), float(q[1]), float(p[2]))
                     pole = [pole_style.group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[2]), 2),
                             round(yaw, 1), 1.0, pole_style.height, 0.0]
-                    if not clearance.clear(pole):
+                    if not clearance.clear(pole) or on_street(q[0], q[1]):
                         if wires is not None and len(run_poles) > 1:
                             wires.extend(_own_spans(run_poles, box))
                         run_poles = []
@@ -1307,7 +1317,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
             pole_style = pole_at(fid, float(q[0]), float(q[1]), float(p[2]))
             pole = [pole_style.group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[2]), 2),
                     round(yaw, 1), 1.0, pole_style.height, 0.0]
-            if not clearance.clear(pole):
+            if not clearance.clear(pole) or on_street(q[0], q[1]):
                 if len(run) > 1 and wires is not None:
                     wires.extend(_own_spans(run, box))
                 run = []
@@ -1322,6 +1332,13 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
             wires.extend(_own_spans(run, box))
     # Poles were checked before joining their wire runs; signs before selecting their relocated spot.
     rows = [r for r in rows if r[0] in (G_POLE, G_SIGNAL, G_STOP, G_YIELD) or clearance.clear(r)]
+    if streets is not None and rows:    # (the lamps: their posts off the surveyed carriageways too, with their poles')
+        lamp = [k for k, r in enumerate(rows) if r[0] in (G_LAMP, G_POLELAMP, "fr_lantern")]
+        if lamp:
+            lat, lon, _ = pole_frame.enu_to_geodetic(np.array([rows[k][1] for k in lamp], np.float64),
+                                                     np.array([rows[k][2] for k in lamp], np.float64), 0.0)
+            gone = {k for k, b in zip(lamp, streets.blocked(lat, lon)) if b}
+            rows = [r for k, r in enumerate(rows) if k not in gone]
     if poleprofiles.kit_enabled(pole_profile):
         import regionalmarkers
         country_at=poleprofiles.country_selector(pole_profile,pole_frame)

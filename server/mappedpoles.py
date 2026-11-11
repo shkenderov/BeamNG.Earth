@@ -229,8 +229,13 @@ def place(frame, box, layers, elev, props, wires, pole_profile, urban_fn=None, e
     lat = np.array([unique[k][1] for k in keys])
     lon = np.array([unique[k][2] for k in keys])
     _, _, z = frame.geodetic_to_enu(lat, lon, np.asarray(elev(lat, lon), float))
+    import sofiastreets                     # (Sofia's surveyed streets, BNE_SOFIA_STREETS: none on a carriageway)
+    streets = sofiastreets.from_env()
+    on_street = streets.blocked(lat, lon) if streets is not None else np.zeros(len(keys), bool)
     poles = {}
     for k, key in enumerate(keys):
+        if on_street[k]:
+            continue
         xy, _, _, tags, height = unique[key]
         # (everywhere: the game's own wooden pole, the one furniture.place guesses, at its own height for its wires)
         style = poleprofiles.STOCK if everywhere else _style(choose(key, *xy, float(z[k])), tags, height)

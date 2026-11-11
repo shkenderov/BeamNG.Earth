@@ -506,7 +506,9 @@ def _facts_key(feats, kind, extra):
     if cid is None or not revisit.ON or revisit.CACHE_DIR is None:
         return None
     # (by FACTS_FORMAT, not the code: kept across updates, the user, 2026-11-02; cid carries the map data's versions)
-    return revisit.format_key("cellfacts", FACTS_FORMAT, kind, cid, extra)
+    # (Sofia's surveyed streets, while on: every kind's, the ranges and the structures are made from the widths)
+    sofia = _sofia_key()
+    return revisit.format_key("cellfacts", FACTS_FORMAT, kind, cid, (extra, sofia) if sofia else extra)
 
 
 def _facts_load(feats, kind, extra):
@@ -2104,7 +2106,8 @@ def _road_specs_kept(feats, urban_fn=None, widths=None, left_hand=False):
     if got is None:             # (the measured widths on the specs without them: those are asked for too, _bridge_reach)
         keep = True             # (specs made while a download failed are not remembered: asked again, PR #634)
         extra = (widths is not None, bool(left_hand)) + ((franceroads.VERSION,) if franceroads.ON else ()) + (
-            (photosurface.TAG,) if photosurface.ON else ()) + ((europewalks.VERSION,) if europewalks.enabled() else ())
+            (photosurface.TAG,) if photosurface.ON else ()) + ((europewalks.VERSION,) if europewalks.enabled() else ()) \
+            + _sofia_key()
         cid = feats.__dict__.get("_bnge_cell")
         # (the land cover's too, by this process's urban_fn: its own Surface, the same all along; a city layer's
         # specs with its parking widths were ~0.37 s of each of its road tiles after every reload, 2026-11-02)
@@ -2169,7 +2172,15 @@ def _street_spec_key(urban_fn, widths, left_hand):
         k += (franceroads.VERSION,)
     if europewalks.enabled():
         k += (europewalks.VERSION,)
-    return k
+    return k + _sofia_key()
+
+
+def _sofia_key():
+    """The spec keys' part for Sofia's surveyed streets: (("sofia", the dataset's tag),) while BNE_SOFIA_STREETS names
+    one, () without (the keys as they were)."""
+    import sofiastreets
+    streets = sofiastreets.from_env()
+    return (("sofia", streets.tag, SOFIA_RULES),) if streets is not None else ()
 
 
 # Lane tapers (the user, 2026-10-31: "the bridge geometry as lanes merge and split is rough"; bridgewidth.py: 54 of
@@ -3184,6 +3195,7 @@ def _road_specs(feats, urban_fn, left_hand, towns=None):
     if towns is not None:
         towns[:] = [sp is not None and sp.urban for sp in out]
     out = _swedish_specs(feats, out)
+    out = _sofia_specs(feats, out)[0]
     out = _rings(feats, out)
     out = dual_carriageways(feats, out, left_hand)
     # A primary's opposite carriageway can supply all of its apparent development
@@ -3366,6 +3378,323 @@ def _swedish_specs(feats, specs, widths_only=False):
         if not mapped and sp.cls != "motorway" and sp.cls != "track":
             w = carriageway(sp.cls, "gravel" if sp.cls in SE_NO_STRIPS else "paved", False, None, sp.oneway, sp.lanes)
         out[j] = sp._replace(width=w, urban=urban, kind=kind, surf=surf, parking=False)
+    return out
+
+
+# Sofia's roads as the municipality surveyed them (sofiastreets.py: GIS-Sofia's carriageway, sidewalk and parking
+# polygons; BNE_SOFIA_STREETS names the file, off without it; the player, 2026-11-10: "some roads just become single
+# lane for no reason"). A road's carriageway is its surveyed width where the survey has it (the median of its
+# stations': one width along the map segment, evened along the road: _sofia_widths_local). The survey draws the
+# parking bays as their own polygons beside the carriageway (a residential street's 5.8 m was drawn 10.6 m, 6 m and
+# PARKING_M both sides), so the parking lanes stay only in a carriageway with room for them beside its driving lanes;
+# a narrower one is all driving lanes and has no cars parked along it (_sofia_no_curb_cars). A two-way road's
+# sidewalks are on the sides the survey has one (when it has any). Where the survey has no carriageway under a road
+# of its area and none to go on in (a service road, a new street) the road is read as Sweden's are (_swedish_specs):
+# no parking lanes in a town street's width. The map's own lane count stays (lane_layout fits it to the width);
+# OpenStreetMap's sidewalk tag still overrides the sides (_osm_sidewalks, after this).
+SOFIA_SKIP = {"service"}        # classes the survey is not asked for: lots and alleys, mostly not in it (17 % of them)
+SOFIA_SPREAD = 0.5              # a road whose stations' widths spread (their interquartile range) over this share of
+SOFIA_SPREAD_M = 2.0            # their median, and over this: lanes joining or leaving along it, no one width; guessed
+SOFIA_MIN_W = {False: 3.0, True: 2.5}       # m: the narrowest carriageway taken, two-way / one-way
+SOFIA_WALK_CLASSES = SIDEWALK_CLASSES | {"trunk"}   # the classes whose sidewalk sides the survey sets
+SOFIA_RULES = 2                 # these rules' version, in the specs', the facts' and the plans' keys (_sofia_key)
+SOFIA_STEP_M = 1.0              # along a road (_sofia_widths_local): a short piece this much narrower or wider than
+SOFIA_SHORT_M = 100.0           # both the pieces it goes on in takes the nearer one's width; short: under this length
+SOFIA_FEW = 8                   # or measured at fewer stations than this
+
+
+def sofia_measures(feats):
+    """Per feature: its carriageway as Sofia's survey has it (sofiastreets.Measure), or None: no survey
+    (BNE_SOFIA_STREETS), not a road it is asked for, nothing under it. A road's is its home cell's (the cell of its
+    first point, among this cell and the eight round it: _sofia_measures_local), so every cell it crosses has the same
+    (as lane_flow's). Pure given the survey and the cells; remembered on feats."""
+    return _cell_memo(feats, "_sofia_measures_home", lambda: _sofia_measures_home(feats))
+
+
+def _sofia_measures_home(feats):
+    return _sofia_home(feats, _sofia_measures_local)
+
+
+def sofia_widths(feats):
+    """Per feature: the surveyed carriageway width (m) it is drawn with, or None (sofia_measures' None, or a measure
+    not to be used: _sofia_widths_local). Its home cell's, as sofia_measures. Remembered on feats."""
+    return _cell_memo(feats, "_sofia_widths_home", lambda: _sofia_home(feats, _sofia_widths_local))
+
+
+def _sofia_widths_local(feats):
+    """sofia_widths of the roads whose home cell this layer is, each from its own measure and the measures of the
+    pieces it goes on in (the lane checker; the user, 2026-11-10: "some roads just become single lane for no reason",
+    "any sudden changes are detected and smoothened out"). The pieces of one road were measured one by one: on 2,519
+    roads of central Sofia 53 came out 1.5 m or more narrower than both the pieces they go on in (22 with the guessed
+    widths), most of them short ones between junctions, and the pieces with nothing surveyed under them kept a guess
+    between two surveyed ones. So, along a road (the one other piece of its class at a joint with its name, or the only
+    other road there):
+    - a piece with no usable measure takes the mean of the surveyed pieces it goes on in;
+    - a short piece (SOFIA_SHORT_M, or measured at under SOFIA_FEW stations) over SOFIA_STEP_M narrower or wider than
+      both takes the nearer one's width.
+    Only pieces of this home cell count on either side (the same answer whichever cell asks: no cell's neighbours'
+    neighbours). Pure given the survey and the layer; remembered on feats."""
+    got = feats.__dict__.get("_sofia_widths")
+    if got is not None:
+        return got
+    meas = _sofia_measures_local(feats)
+    n = len(feats)
+    cls = feats.attrs["class"].astype(str) if "class" in feats.attrs else np.full(n, "unknown")
+    raw = [None] * n
+    for i, m in enumerate(meas):
+        if m is not None and cls[i] not in SOFIA_SKIP and m.width >= SOFIA_MIN_W[True] \
+                and m.spread <= max(SOFIA_SPREAD_M, SOFIA_SPREAD * m.width):
+            raw[i] = float(m.width)
+    out = list(raw)
+    con = feats.rules.get("connectors") if any(w is not None for w in raw) else None
+    if con is not None:
+        me = feats.__dict__.get("_bnge_cell")
+        homes = _home_cells(feats) if me is not None else None
+        name = feats.attrs["name"].astype(str) if "name" in feats.attrs else None
+        asked = [i for i in range(n) if _sofia_asked(feats, i)]
+        ends, at, through = {}, {}, set()
+        for i in asked:
+            ends[i] = ([], [])
+            for c, a, _b in con.for_feature(i):
+                e = 0 if a <= 1e-6 else 1 if a >= 1 - 1e-6 else None
+                if e is None:
+                    through.add(c)
+                else:
+                    ends[i][e].append(c)
+                    at.setdefault(c, []).append(i)
+
+        def onward(i, e):
+            for c in ends[i][e]:
+                same = {o for o in at[c] if o != i and cls[o] == cls[i]}
+                if name is not None and name[i] not in ("", "None", "nan"):
+                    named = {o for o in same if name[o] == name[i]}
+                    if len(named) == 1:
+                        return next(iter(named))
+                if len(same) == 1 and c not in through and len(set(at[c])) == 2:
+                    return next(iter(same))
+            return None
+
+        lengths = _lengths(feats)
+        for i in asked:
+            if cls[i] in SOFIA_SKIP or (homes is not None and homes[i] != me[0]):
+                continue
+            near = [raw[o] for o in (onward(i, 0), onward(i, 1)) if o is not None and raw[o] is not None]
+            if raw[i] is None:
+                if near:
+                    out[i] = sum(near) / len(near)
+            elif len(near) == 2 and (lengths[i] < SOFIA_SHORT_M or meas[i].stations < SOFIA_FEW):
+                lo, hi = min(near), max(near)
+                if raw[i] < lo - SOFIA_STEP_M:
+                    out[i] = lo
+                elif raw[i] > hi + SOFIA_STEP_M:
+                    out[i] = hi
+    feats.__dict__["_sofia_widths"] = out
+    return out
+
+
+def _sofia_home(feats, local):
+    """local(feats)'s rows, those of the roads whose home cell is another's from that cell's layer (local of it)."""
+    out = list(local(feats))
+    me = feats.__dict__.get("_bnge_cell")
+    hook = feats.__dict__.get("_bnge_neighbours")
+    import sofiastreets
+    if me is not None and hook is not None and sofiastreets.from_env() is not None:
+        rows = {}
+        for i, home in enumerate(_home_cells(feats)):
+            if home != me[0] and _sofia_asked(feats, i):
+                rows.setdefault(home, []).append(i)
+        if rows:
+            try:
+                near = {f.__dict__["_bnge_cell"][0]: f for f in hook() if f is not None and f.__dict__.get("_bnge_cell")}
+            except Exception as e:          # (this cell's own)
+                log.debug("sofia streets: neighbours: %s: %s", type(e).__name__, e)
+                near = {}
+            for home, idx in rows.items():
+                other = near.get(home)
+                if other is None:
+                    continue
+                res = local(other)
+                pos = other.__dict__.get("_id_pos")
+                if pos is None:
+                    pos = other.__dict__["_id_pos"] = {fid: j for j, fid in enumerate(other.ids.tolist())}
+                for i in idx:
+                    j = pos.get(feats.ids[i])
+                    if j is not None:
+                        out[i] = res[j]
+    return out
+
+
+def _sofia_asked(feats, i):
+    """Is feature i a road the survey is asked for: a road of a class built here, with a line?"""
+    if str(feats.attrs.get("subtype", ["road"] * len(feats))[i]) != "road":
+        return False
+    cls = str(feats.attrs["class"][i]) if "class" in feats.attrs else "unknown"
+    if cls not in STYLE:
+        return False
+    a = feats.coord_off[feats.ring_off[feats.part_off[i]]]
+    b = feats.coord_off[feats.ring_off[feats.part_off[i + 1]]]
+    return b - a >= 2
+
+
+def _sofia_measures_local(feats):
+    """sofia_measures of the roads whose home cell this layer is (every road's, of a layer without a cell: tests),
+    each measured in its home cell's raster with all of this layer's road lines (the lines that share a carriageway
+    cut it between them). Remembered on feats."""
+    got = feats.__dict__.get("_sofia_measures")
+    if got is not None:
+        return got
+    import mapcells
+    import sofiastreets
+    out = [None] * len(feats)
+    streets = sofiastreets.from_env()
+    kept = _sofia_kept_path(feats, streets) if streets is not None else None
+    if kept is not None:
+        got = _sofia_kept_load(kept, feats)
+        if got is not None:
+            feats.__dict__["_sofia_measures"] = got
+            return got
+    if streets is not None and len(feats):
+        idx = [i for i in range(len(feats)) if _sofia_asked(feats, i)]
+        if idx:
+            lines = []
+            for i in idx:
+                a = feats.coord_off[feats.ring_off[feats.part_off[i]]]
+                b = feats.coord_off[feats.ring_off[feats.part_off[i + 1]]]
+                lines.append(np.asarray(feats.lonlat[a:b], np.float64))
+            homes = _home_cells(feats)
+            me = feats.__dict__.get("_bnge_cell")
+            by = {}
+            for k, i in enumerate(idx):
+                if me is None or homes[i] == me[0]:
+                    by.setdefault(homes[i], []).append(k)
+            for home, ks in sorted(by.items()):
+                z, x, y = (int(v) for v in home.split("/"))
+                key = mapcells.CellKey(z, x, y)
+                if not streets.covers(key):
+                    continue
+                res = streets.measure_cell(key, lines)
+                for k in ks:
+                    out[idx[k]] = res[k]
+    if kept is not None:
+        _sofia_kept_store(kept, feats, out)
+    feats.__dict__["_sofia_measures"] = out
+    return out
+
+
+# A cell's measures kept on disk, <cache>/sofiastreets/<the measuring's and the dataset's versions>/<the cell and its
+# map data>.json: a road tile's specs ask its cell and the eight round it (their roads' home cells: _sofia_measures_home),
+# ~1 s each (a raster of the cell's polygons, a ray across every 4 m of its roads), in each of the server's road
+# processes and again at every start: a first road tile of central Sofia took 30 s for 3 s (2026-11-10).
+def _sofia_kept_path(feats, streets):
+    me = feats.__dict__.get("_bnge_cell")
+    import revisit
+    if me is None or revisit.CACHE_DIR is None:
+        return None
+    import sofiastreets
+    h = hashlib.sha1(repr(tuple(me)).encode()).hexdigest()[:24]
+    return os.path.join(revisit.CACHE_DIR, "sofiastreets", f"m{sofiastreets.MEASURE_VERSION}-{streets.tag}", h[:2],
+                        h + ".json")
+
+
+def _sofia_kept_load(path, feats):
+    """The cell's kept measures (a list per feature), or None: none kept, another layer's, unreadable."""
+    import sofiastreets
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+        if d.get("ids") != [str(i) for i in feats.ids.tolist()]:
+            return None
+        return [None if r is None else sofiastreets.Measure(*r) for r in d["rows"]]
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def _sofia_kept_store(path, feats, measures):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"ids": [str(i) for i in feats.ids.tolist()],
+                       "rows": [None if m is None else list(m) for m in measures]}, fh)
+        os.replace(tmp, path)
+    except OSError as e:
+        log.debug("sofia streets: %s: %s", path, e)
+
+
+def _sofia_width(sp, w):
+    """The surveyed width (m) a road of spec sp takes of sofia_widths' w, or None: none, or one not to be used."""
+    if w is None or sp is None or sp.cls in SOFIA_SKIP or w < SOFIA_MIN_W[bool(sp.oneway)]:
+        return None
+    return float(w)
+
+
+def _sofia_specs(feats, specs, decks=False):
+    """specs with Sofia's surveyed carriageways (the comment above); decks: bridge and tunnel specs (their width
+    alone: a road goes on over its bridge as wide as it came). Returns (specs, surveyed): surveyed, per feature,
+    whether its width is the survey's. Pure given the survey."""
+    import sofiastreets
+    streets = sofiastreets.from_env()
+    surveyed = [False] * len(specs)
+    if streets is None or not len(feats):
+        return specs, surveyed
+    measures, widths = sofia_measures(feats), sofia_widths(feats)
+    inside = _sofia_inside(feats, streets)
+    rules, out = feats.rules, list(specs)
+    for j in np.flatnonzero(inside).tolist():
+        sp = out[j]
+        if sp is None or is_ring(feats, j):     # (a roundabout: _rings' circulatory width)
+            continue
+        w = _sofia_width(sp, widths[j])
+        if w is not None:
+            surveyed[j] = True
+            if decks:
+                out[j] = sp._replace(width=w)
+                continue
+            m = measures[j]
+            sides = sp.sides
+            # (a two-way road's alone: a divided road's carriageways take their median's side later,
+            # dual_carriageways, and a side set here moved the median band outward on a third of them; and never
+            # no sidewalk at all: a town street without one is drawn with a country road's dirt edge)
+            if m is not None and sp.kind in BUILT and sp.cls in SOFIA_WALK_CLASSES and not sp.oneway and (
+                    m.walk_left or m.walk_right):
+                sides = tuple(side for side, has in ((1, m.walk_left), (-1, m.walk_right)) if has)
+            # (the parking lanes stay where the surveyed carriageway holds them beside its driving lanes; a narrower
+            # one is all driving lanes, and has no parked cars: _sofia_no_curb_cars)
+            room = w - assumed_parking(sp)
+            out[j] = sp._replace(width=w, parking=bool(sp.parking and room >= (1 if sp.oneway else 2) * LANE_M),
+                                 sides=sides)
+        elif not decks and sp.parking and not sp.link and assumed_parking(sp) > 0.0 and (
+                _rule_value(rules.get("width"), j) is None and _osm(feats, "width", j, *OSM_WIDTH_M) is None):
+            # (no survey under it: the class's or its lanes' width without the parking lanes, as Sweden's streets)
+            out[j] = sp._replace(width=sp.width - assumed_parking(sp), parking=False)
+    return out, surveyed
+
+
+def _sofia_inside(feats, streets):
+    """Per feature: does it start inside the survey's box?"""
+    s, w, n, e = streets.bounds
+    first = feats.lonlat[feats.coord_off[feats.ring_off[feats.part_off[:-1]]]]
+    return (first[:, 1] > s) & (first[:, 1] < n) & (first[:, 0] > w) & (first[:, 0] < e)
+
+
+def _sofia_no_curb_cars(seen):
+    """The ids of a tile's roads (build_tile's seen: fid -> (feats, i, spec)) that get no curbside parked cars: in
+    Sofia's survey box, with no parking lanes (_sofia_specs: a carriageway as surveyed, all of it driving lanes;
+    parking.curb_spots goes by the width alone and parked them in the lanes the AI drives)."""
+    import sofiastreets
+    streets = sofiastreets.from_env()
+    out = set()
+    if streets is None:
+        return out
+    inside = {}
+    for fid, (f, i, sp) in seen.items():
+        if sp.parking:
+            continue
+        got = inside.get(id(f))
+        if got is None:
+            got = inside[id(f)] = _sofia_inside(f, streets)
+        if got[i]:
+            out.add(fid)
     return out
 
 
@@ -3604,6 +3933,10 @@ def _bridge_specs(feats, want="bridge"):
                         surf=surface_token(surf), link=link, dir=(-1 if float(ov) < 0 else 1) if ov is not None else 0))
         free[i] = ow or rule_w is not None
     out = _swedish_specs(feats, out, widths_only=True)      # (first: a divided road's deck is capped from its width)
+    out, surveyed = _sofia_specs(feats, out, decks=True)    # (Sofia's surveyed width: the deck's own, as mapped ones)
+    for i, yes in enumerate(surveyed):
+        if yes:
+            free[i] = True
     for i, sp in enumerate(out):
         g = ground[i] if ground is not None and sp is not None else None
         if g is not None and g.median:
@@ -10689,7 +11022,9 @@ def build_tile(frame, tx, ty, cells, elev, urban_fn=None, walks=None, bridges=No
                 if sp.oneway:
                     v = _rule_value(f.rules.get("oneway"), i)
                     dirs[fid] = (-1 if float(v) < 0 else 1) if v is not None else (sp.dir or 1)
-            park.extend(parking.curb_spots(roads, walks, own_box, left_hand, dirs))
+            bare = _sofia_no_curb_cars(seen)
+            park.extend(parking.curb_spots(roads, [w for w in walks if w.get("fid") not in bare] if bare else walks,
+                                           own_box, left_hand, dirs))
             if aisles:
                 park.extend(parking.aisle_spots(roads, aisles, own_box))
         if marks is not None and aisles:            # stall lines along the aisles (parking.aisle_markings)

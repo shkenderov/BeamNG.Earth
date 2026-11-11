@@ -83,7 +83,10 @@ def plans_format():
     import grading
     # (the grade guard, off by default, makes other plans: its own key, so that the two never mix and nobody else's
     # plans are thrown away)
-    return f"{PLANS_FORMAT}.{roads.FACTS_FORMAT}" + (".gg1" if grading.GUARD_ON else "")
+    # (and Sofia's surveyed streets, BNE_SOFIA_STREETS: plans made of other widths, never mixed with the others)
+    sofia = "".join(".sofia" + "".join(ch for ch in f"{tag}r{rules}" if ch.isalnum())
+                    for _name, tag, rules in roads._sofia_key())
+    return f"{PLANS_FORMAT}.{roads.FACTS_FORMAT}" + (".gg1" if grading.GUARD_ON else "") + sofia
 
 
 FRAMES = "r10"          # the plans' frames: their planning regions' (geotiles.PLAN_Z), not an anchor's
