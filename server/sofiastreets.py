@@ -44,7 +44,7 @@ log = logging.getLogger("earthd.sofiastreets")
 
 ENV = "BNE_SOFIA_STREETS"   # streets_curbs.geojson's path (or its .npz); unset or "off": the roads as before
 VERSION = 1                 # the .npz's layout and the kinds below: a new number is a new file
-MEASURE_VERSION = 1         # measure_cell's rules and constants: a new number where its answers change (roads.py keeps
+MEASURE_VERSION = 2         # measure_cell's rules and constants: a new number where its answers change (roads.py keeps
                             # each cell's on disk under it)
 RES_M = 0.5                 # m: the rasters' pixels (the polygons' corners are surveyed to centimetres)
 MARGIN_M = 150.0            # m past a cell's box its raster reaches (a road's line runs on past the cell)
@@ -62,6 +62,7 @@ TWIN_MIN_M = 2.0            # m: a line nearer than this is the road's own next 
 WALK_REACH_M = 3.0          # m past the carriageway's edge a sidewalk counts as the road's
 PARK_REACH_M = 0.75         # m past the edge a parking bay adjoins it
 SIDE_SHARE = 0.5            # a side has a sidewalk / parking when this share of its stations do
+WALK_RUN_M = 12.0           # m: a sidewalk's width is measured this far across at most (a square beside the street)
 PROP_MARGIN_M = 0.3         # m: blocked()'s reach round a point (a pole's foot)
 
 # the kinds of ground, a bit each in a cell's raster (uint8)
@@ -78,12 +79,13 @@ KINDS = {
 NO_PROPS = CARRIAGEWAY | PARKING | TRACK        # blocked(): no lamp or pole stands on these
 
 Measure = namedtuple("Measure", "width stations spread walk_left walk_right park_left park_right park_m "
-                                "bridge tunnel shared")
+                                "bridge tunnel shared walk_m", defaults=(0.0,))
 Measure.__doc__ = """A road's carriageway as surveyed: width (m, the median of its stations'), stations (how many
 had one), spread (m, their interquartile range), walk_left / walk_right (a sidewalk along that side: left of the
 line's direction), park_left / park_right (parking bays adjoining that side), park_m (their depth across, the median;
 0 without), bridge / tunnel (the share of its stations on a bridge's / a tunnel's carriageway), shared (the share
-whose carriageway is another line's too: cut half way to it)."""
+whose carriageway is another line's too: cut half way to it), walk_m (the sidewalks' width across, the median over
+the stations and sides that have one; 0 without)."""
 
 
 # ---- the file ------------------------------------------------------------------------------------------------
@@ -471,8 +473,22 @@ class Streets:
 
         reach_w, reach_p = int(round(WALK_REACH_M / step)), max(1, int(round(PARK_REACH_M / step)))
         # (past the carriageway's own edges, not a cut's: the other road's side has no sidewalk of this one's)
-        wl = beyond(SIDEWALK | WALK_PARKING, hi, 1, reach_w)[0] & (a1 == hi)
-        wr = beyond(SIDEWALK | WALK_PARKING, lo, -1, reach_w)[0] & (a0 == lo)
+        wl, wl0 = beyond(SIDEWALK | WALK_PARKING, hi, 1, reach_w)
+        wr, wr0 = beyond(SIDEWALK | WALK_PARKING, lo, -1, reach_w)
+        wl &= a1 == hi
+        wr &= a0 == lo
+        walk = []
+        for side, has, first in ((1, wl & ok, wl0), (-1, wr & ok, wr0)):
+            if has.any():                   # the sidewalk's width across: its run from where it starts outward
+                run, alive = np.zeros(nst, np.int64), has.copy()
+                for q in range(int(round(WALK_RUN_M / step))):
+                    j = first + side * q
+                    alive &= (j >= 0) & (j < n) & ((b[rows, np.clip(j, 0, n - 1)] & (SIDEWALK | WALK_PARKING)) != 0)
+                    if not alive.any():
+                        break
+                    run += alive
+                walk.append(run[has] * step)
+        walk = np.concatenate(walk) if walk else np.zeros(0)
         pl, pl0 = beyond(PARKING, hi, 1, reach_p)
         pr, pr0 = beyond(PARKING, lo, -1, reach_p)
         pl &= a1 == hi
@@ -497,7 +513,8 @@ class Streets:
                        round(float(np.median(depth)), 2) if len(depth) else 0.0,
                        round(float(np.mean((b[rows, c] & BRIDGE)[ok] != 0)), 3),
                        round(float(np.mean((b[rows, c] & TUNNEL)[ok] != 0)), 3),
-                       round(float(np.mean((has_r | has_l)[ok])), 3))
+                       round(float(np.mean((has_r | has_l)[ok])), 3),
+                       round(float(np.median(walk)), 2) if len(walk) else 0.0)
 
     # ---- props ----
     def blocked(self, lat, lon, margin=PROP_MARGIN_M):

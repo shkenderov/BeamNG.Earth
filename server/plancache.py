@@ -86,6 +86,9 @@ def plans_format():
     # (and Sofia's surveyed streets, BNE_SOFIA_STREETS: plans made of other widths, never mixed with the others)
     sofia = "".join(".sofia" + "".join(ch for ch in f"{tag}r{rules}" if ch.isalnum())
                     for _name, tag, rules in roads._sofia_key())
+    import sofiadtm
+    if sofiadtm.from_env() is not None:     # (a fine terrain model: its tunnels' rules, roads.FINE_TUNNEL_RULES)
+        sofia += f".ft{roads.FINE_TUNNEL_RULES}"
     return f"{PLANS_FORMAT}.{roads.FACTS_FORMAT}" + (".gg1" if grading.GUARD_ON else "") + sofia
 
 

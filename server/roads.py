@@ -3198,6 +3198,7 @@ def _road_specs(feats, urban_fn, left_hand, towns=None):
     out = _sofia_specs(feats, out)[0]
     out = _rings(feats, out)
     out = dual_carriageways(feats, out, left_hand)
+    out = _sofia_oneway_sides(feats, out)
     # A primary's opposite carriageway can supply all of its apparent development
     # on one side. Apply the major-highway rule after pairing, without changing
     # ordinary town main streets or explicitly mapped sidewalk/lighting tags.
@@ -3397,7 +3398,14 @@ SOFIA_SPREAD = 0.5              # a road whose stations' widths spread (their in
 SOFIA_SPREAD_M = 2.0            # their median, and over this: lanes joining or leaving along it, no one width; guessed
 SOFIA_MIN_W = {False: 3.0, True: 2.5}       # m: the narrowest carriageway taken, two-way / one-way
 SOFIA_WALK_CLASSES = SIDEWALK_CLASSES | {"trunk"}   # the classes whose sidewalk sides the survey sets
-SOFIA_RULES = 2                 # these rules' version, in the specs', the facts' and the plans' keys (_sofia_key)
+SOFIA_RULES = 3                 # these rules' version, in the specs', the facts' and the plans' keys (_sofia_key)
+# The sidewalks (the player, 2026-11-11: "the sidewalks are sometimes weird"; measured over the centre's 8 491 surveyed
+# roads): half of them are one-way streets, whose sides were not the survey's (a divided road's median, below): 27 %
+# of those have a sidewalk along one side only and got one along both. A one-way street that is no divided road's
+# carriageway (no median found for it: after dual_carriageways, _sofia_oneway_sides) takes the survey's one side. And
+# every sidewalk was the class's 2.5 m, where the surveyed ones are 1.5 m at the 10th percentile and 4.8 m at the
+# 90th (a fifth over 3.5 m): a road's sidewalks are as wide as surveyed (Measure.walk_m), within SOFIA_WALK_M.
+SOFIA_WALK_M = (1.5, 4.5)
 SOFIA_STEP_M = 1.0              # along a road (_sofia_widths_local): a short piece this much narrower or wider than
 SOFIA_SHORT_M = 100.0           # both the pieces it goes on in takes the nearer one's width; short: under this length
 SOFIA_FEW = 8                   # or measured at fewer stations than this
@@ -3661,13 +3669,36 @@ def _sofia_specs(feats, specs, decks=False):
             # (the parking lanes stay where the surveyed carriageway holds them beside its driving lanes; a narrower
             # one is all driving lanes, and has no parked cars: _sofia_no_curb_cars)
             room = w - assumed_parking(sp)
+            walk = sp.walk
+            if m is not None and m.walk_m > 0 and sp.kind in BUILT and sp.cls in SOFIA_WALK_CLASSES:
+                walk = float(min(max(m.walk_m, SOFIA_WALK_M[0]), SOFIA_WALK_M[1]))
             out[j] = sp._replace(width=w, parking=bool(sp.parking and room >= (1 if sp.oneway else 2) * LANE_M),
-                                 sides=sides)
+                                 sides=sides, walk=walk)
         elif not decks and sp.parking and not sp.link and assumed_parking(sp) > 0.0 and (
                 _rule_value(rules.get("width"), j) is None and _osm(feats, "width", j, *OSM_WIDTH_M) is None):
             # (no survey under it: the class's or its lanes' width without the parking lanes, as Sweden's streets)
             out[j] = sp._replace(width=sp.width - assumed_parking(sp), parking=False)
     return out, surveyed
+
+
+def _sofia_oneway_sides(feats, specs):
+    """specs with a surveyed one-way street's sidewalk on the one side the survey has one (SOFIA_RULES' comment): not
+    a divided road's carriageway (its median's side is dual_carriageways'), nor a road whose sides are set already.
+    Pure given the survey."""
+    import sofiastreets
+    streets = sofiastreets.from_env()
+    if streets is None or not len(feats):
+        return specs
+    measures, widths = sofia_measures(feats), sofia_widths(feats)
+    out = list(specs)
+    for j in np.flatnonzero(_sofia_inside(feats, streets)).tolist():
+        sp, m = out[j], measures[j]
+        if sp is None or m is None or not sp.oneway or sp.median or sp.sides is not None or sp.link or \
+                sp.kind not in BUILT or sp.cls not in SOFIA_WALK_CLASSES or sp.cls == "trunk" or \
+                is_ring(feats, j) or _sofia_width(sp, widths[j]) is None or m.walk_left == m.walk_right:
+            continue
+        out[j] = sp._replace(sides=(1,) if m.walk_left else (-1,))
+    return out
 
 
 def _sofia_inside(feats, streets):
@@ -7623,15 +7654,82 @@ class BridgeProfiles:
         return key[0]
 
 
-def tunnel_sections(s, g, open_cover=None, full_cover=None, min_m=SECTION_MIN_M):
+# A street tunnel on a fine terrain model (Sofia's 1 m, sofiadtm.py; the player, 2026-11-11: "the damn tunnels are a
+# big problem"). A surveyed model has the street over the tunnel and the ramps down to its mouths, but not the road
+# inside, and at a mouth it reads the ramp only part of the way down (its heights are interpolated between the ramp's
+# contours and the street's over the portal): the mouths of the tunnel under the NDK (bul. Gen. Skobelev, 390 m) are
+# 3 m under the square, of bul. Yavorov's 2.5 m, of Tsarigradsko shose's underpasses 2.2-3.3 m, where the road is
+# 5-6 m down. Under TUNNEL_OPEN_COVER all of them were "open": a road in a 3 m trench across the square and the
+# streets over it (14 of Sofia's 17 primary tunnel parts). There (fine_tunnel_sink: every sample on the model, a
+# street of FINE_TUNNEL_CLASSES: a service road's "tunnel" is a passage through a building, its ground a slope) the
+# ground FINE_OPEN_COVER over the line between the mouths somewhere says the tunnel is one (under it a road under a
+# bridge the model does not hold, bul. Botevgradsko shose's: flat, open as before), and then it is covered wherever
+# the ground is FINE_EXTENT_COVER over that line (the NDK tunnel's east mouth reads 1-2 m under the square: half the
+# tunnel stayed open with one threshold). The floor goes down inside each covered run until the tube and its soil fit
+# under the street (the 80th percentile of what is missing, FINE_SINK_MAX_M at most), FINE_SINK_GRADE from the run's
+# ends and less where the run itself slopes (FINE_FLOOR_GRADE in all, FINE_SINK_GRADE_MIN at least): the mouths, the
+# open ramps and their grading stay where the ground has them.
+FINE_TUNNEL_CLASSES = {"motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link", "secondary",
+                       "secondary_link", "tertiary", "tertiary_link"}
+FINE_OPEN_COVER = 2.0
+FINE_EXTENT_COVER = 0.75
+FINE_SINK_GRADE = 0.06
+FINE_SINK_GRADE_MIN = 0.02
+FINE_FLOOR_GRADE = 0.08
+FINE_SINK_MAX_M = 5.0
+FINE_SINK_PCT = 80
+FINE_TUNNEL_RULES = 1           # these rules' version, in the plans' key while a fine model is read (plancache)
+
+
+def fine_tunnel_sink(spec, lat, lon):
+    """The height (m) a tunnel's floor is wanted under the ground over it where its samples (lat, lon) all lie on a
+    fine terrain model and its road is a street's (FINE_TUNNEL_CLASSES): the tube's and its soil's; None elsewhere
+    (tunnel_sections as before). The same in every process (the model is the environment's)."""
+    if spec is None or spec.cls not in FINE_TUNNEL_CLASSES:
+        return None
+    import sofiadtm
+    model = sofiadtm.from_env()
+    if model is None or not np.all(model.valid_at(np.asarray(lat, np.float64), np.asarray(lon, np.float64))):
+        return None
+    return (MAJOR_LOW_H if spec.cls in CONCRETE_WALL_CLASSES else TUNNEL_LOW_H) + TUNNEL_SOIL_M
+
+
+def _sunk_floor(s, g, floor, kinds, sink):
+    """floor lowered inside each covered run of kinds (1 / 2) towards g - sink (FINE_SINK_*): by nothing at the run's
+    ends. Pure."""
+    floor = np.array(floor, np.float64)
+    i, n = 0, len(kinds)
+    while i < n:
+        if kinds[i] == 0:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and kinds[j + 1] != 0:
+            j += 1
+        if j > i:
+            short = floor[i:j + 1] - (g[i:j + 1] - sink)
+            d = min(max(float(np.percentile(short, FINE_SINK_PCT)), 0.0), FINE_SINK_MAX_M)
+            if d > 0:
+                run = s[i:j + 1]
+                own = abs(float(floor[j] - floor[i])) / max(float(run[-1] - run[0]), 1e-6)
+                grade = min(max(FINE_FLOOR_GRADE - own, FINE_SINK_GRADE_MIN), FINE_SINK_GRADE)
+                floor[i:j + 1] -= np.minimum(d, grade * np.minimum(run - run[0], run[-1] - run))
+        i = j + 1
+    return floor
+
+
+def tunnel_sections(s, g, open_cover=None, full_cover=None, min_m=SECTION_MIN_M, sink=None):
     """A tunnel's road level and its sections from the ground over it (g at arc lengths s): (floor, kinds). floor: the
     lower convex hull of (s, g), the road's level under the covered parts and the ground where it lies open; kinds per
     sample: 0 open road, 1 a low arch, 2 a full tunnel (a run with TUNNEL_OPEN_COVER over the floor, full where it
     reaches TUNNEL_COVER; runs and gaps shorter than min_m merged away). One long 'tunnel' in the map can be a sunken
     road with arches and a rock tunnel along it (Central Park's 79th Street Transverse, 683 m: one tube, 2026-10-17).
-    The Rust kernel (fast). Pure."""
+    sink (fine_tunnel_sink; None: not): a street's tunnel on a fine terrain model, a cover from FINE_OPEN_COVER and
+    its floor sunk under it (_sunk_floor). The Rust kernel (fast). Pure."""
     s = np.ascontiguousarray(s, np.float64)
     g = np.ascontiguousarray(g, np.float64)
+    if sink is not None and open_cover is None:
+        open_cover = FINE_OPEN_COVER
     oc = TUNNEL_OPEN_COVER if open_cover is None else open_cover
     fc = TUNNEL_COVER if full_cover is None else full_cover
     step = float(np.median(np.diff(s))) if len(s) > 1 else 1.0
@@ -7639,7 +7737,13 @@ def tunnel_sections(s, g, open_cover=None, full_cover=None, min_m=SECTION_MIN_M)
     import fast
     fast.require(28, "tunnel_sections")
     f, k = fast._ef.tunnel_sections(s, g, float(oc), float(fc), int(min_n))
-    return _shallow_full_low(s, g, np.asarray(f), np.asarray(k))
+    if sink is not None and np.asarray(k).any() and oc > FINE_EXTENT_COVER:
+        # (a real tunnel: covered as far as the ground rises over it at all)
+        f, k = fast._ef.tunnel_sections(s, g, float(FINE_EXTENT_COVER), float(fc), int(min_n))
+    floor, kinds = _shallow_full_low(s, g, np.asarray(f), np.asarray(k))
+    if sink is not None:
+        floor = _sunk_floor(s, g, floor, kinds, float(sink))
+    return floor, kinds
 
 
 def _shallow_full_low(s, g, floor, kinds):
@@ -7841,7 +7945,8 @@ class TunnelProfiles(BridgeProfiles):
                 cover_ground = np.where(np.asarray(d) > .5, np.maximum(g, lz), g)
                 kinds = np.where(cover_ground - floor >= TUNNEL_COVER - .02, 2, 0)
             else:
-                floor, kinds = tunnel_sections(s, g)
+                la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.)
+                floor, kinds = tunnel_sections(s, g, sink=fine_tunnel_sink(pool[k][0], la, lo))
                 kinds = portal_cover(kinds, g - floor, pool[k][0], s)
                 kinds = self._cover_roads(xy, s, kinds, ground)
             secs, i = [], 0
