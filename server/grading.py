@@ -75,6 +75,7 @@ CLASS_SIGMA_M = {"secondary": 25.0, "tertiary": 20.0, "unclassified": 16.0, "res
 MEDIAN_M = float(os.environ.get("BNE_GRADE_MEDIAN", "24"))
 DIRT_MEDIAN_M = 10.0        # (tracks keep their small real bumps)
 RAIL_GRADE_ON = os.environ.get("BNE_RAIL_GRADE", "1") != "0"    # the ground laid to the railways' bed (railways.py)
+FINE_RAIL_NODE_M = 8.0      # a railway's bed plan ending this near a sunk tunnel mouth goes down to it (_sink_fine_rails)
 RAIL_TAG = "rail:"
 SHOULDER_M = 1.0            # m of flat shoulder beyond the carriageway, each side
 MOUNTAIN_SHOULDER_M = 0.5   # ... beside a mountain pass road (roads._mountain_roads)
@@ -2180,6 +2181,12 @@ class _Planner:
                     self._lower_underpasses(key, plans)
                 except Exception as e:      # as the data has it rather than no grading
                     log.debug("grading: underpasses of %s: %s: %s", key, type(e).__name__, e)
+            sunk = None
+            if plans and roadsmod.fine_model_on():
+                try:            # a fine model's street tunnels: the roads to their mouths sunk to the mouths' depth
+                    sunk = self._sink_fine_approaches(key, feats, plans)
+                except Exception as e:      # the mouths' ramps inside the tunnels rather than no grading
+                    log.warning("grading: tunnel approaches of %s: %s: %s", key, type(e).__name__, e)
             if JUNCTION_SNAP_ON and plans and (APPROACH_ON or UNDER_ON):
                 # the side roads again, at their roads' heights after the approaches' lifts and the underpasses' dips
                 # (snapped before them, every alley along Baltimore's Haven Street stood up to 3.5 m over the street
@@ -2278,6 +2285,11 @@ class _Planner:
                     p.rank = grade_rank(spec)
                     plans.append((fid + TUNNEL_TAG, p))
             plans.extend(self._mouth_plans(secs, portals))
+            if sunk and sunk[0]:    # (the tracks ending at a sunk mouth: a tram line into the tunnel, down with its road)
+                try:
+                    self._sink_fine_rails(sunk[0], sunk[1] + [(xy, z) for _f, _sp, xy, z, k in secs if k == 0], plans)
+                except Exception as e:
+                    log.warning("grading: tracks at the tunnel mouths of %s: %s: %s", key, type(e).__name__, e)
             covers = [(xy, spec.width / 2 + TUNNEL_KEEP_M) for _f, spec, xy, _z, k in _twin_trimmed(secs) if k]
             opens = [(xy, spec) for _f, spec, xy, _z, k in secs if k == 0]
         else:
@@ -4800,10 +4812,40 @@ class _Planner:
         """[(fid, spec, xy, z, kind)] of the tunnels' sections (roads.tunnel_sections on the ungraded ground, its
         ends graded by road_plans: the cell's road Plans, as roads.TunnelProfiles.ends grades them with the roads'
         plans alone): kind 0 an open road at z, 1 a low arch, 2 a full tunnel."""
-        out = []
         ts = roadsmod.tunnel_specs(feats)
-        pack = None                     # (the road plans packed once: per tunnel part, ~6 ms each, 0.9 s of 8 tiles)
+        slots, items = self._tunnel_items(feats, ts, key, road_plans, portals)
+        # (a fine model's street tunnels with the parts joined to them: roads.fine_tunnel_group, as TunnelProfiles)
+        solved = roadsmod.fine_tunnel_group([(xy, s, g, ends, sink) for _i, xy, s, g, ends, sink in items])[0]
         over = None                     # (the ground roads near the tunnels, as roads.TunnelProfiles covers them)
+        out = []
+        for slot in slots:
+            if not isinstance(slot, int):
+                out.extend(slot)        # (an underwater tunnel's solved sections)
+                continue
+            i, xy, s, _g, _ends, sink = items[slot]
+            floor, kinds, g = solved[slot]
+            if sink is None:        # (as roads.TunnelProfiles: a fine model's open ramps stay open)
+                kinds = roadsmod.portal_cover(kinds, g - floor, ts[i], s)
+            if over is None:
+                over = self._roads_over_tunnels(feats, ts)
+            kinds = roadsmod.cover_roads(xy, s, kinds, *over)
+            i0 = 0
+            while i0 < len(kinds):
+                i1 = i0
+                while i1 + 1 < len(kinds) and kinds[i1 + 1] == kinds[i0]:
+                    i1 += 1
+                a = max(0, i0 - 1)          # sharing the end sample with the section before
+                if i1 > a:
+                    out.append((str(feats.ids[i]), ts[i], xy[a:i1 + 1], floor[a:i1 + 1], int(kinds[i0])))
+                i0 = i1 + 1
+        return out
+
+    def _tunnel_items(self, feats, ts, key=None, road_plans=(), portals=None):
+        """The tunnel parts of feats (ts: their tunnel_specs) as _tunnel_sections reads them: (slots, items), items
+        [(feature index, xy, s, the ungraded ground, its ends' ground graded by road_plans, fine_tunnel_sink)] and
+        slots in the map's order: an index into items, or an underwater part's solved sections (_subsea_part)."""
+        slots, items = [], []
+        pack = None                     # (the road plans packed once: per tunnel part, ~6 ms each, 0.9 s of 8 tiles)
         for i in range(len(feats)):
             if ts[i] is None:
                 continue
@@ -4815,7 +4857,7 @@ class _Planner:
                 if self.water is not None:
                     solved = self._subsea_part(feats, i, j, ring, portals)
                     if solved is not None:
-                        out.extend(solved)
+                        slots.append(solved)
                         continue
                 E, N, _ = self.frame.geodetic_to_enu(ll[:, 1], ll[:, 0], 0.0)
                 xy, s = resample(np.stack([np.asarray(E), np.asarray(N)], axis=1), VERTEX_STEP)
@@ -4828,25 +4870,99 @@ class _Planner:
                 if self.wet is not None and self._drowned((str(feats.ids[i]), j), ring):
                     continue            # (a dry piece of an underwater tunnel: left out with it, GitHub #128)
                 g = np.asarray(self.elev(la, lo), np.float64)
+                ends = g[[0, -1]]
                 if road_plans:
-                    g = g.copy()
                     pack = PlanPack(list(road_plans)) if pack is None else pack
-                    g[[0, -1]] = grade_points(xy[[0, -1], 0], xy[[0, -1], 1], g[[0, -1]], pack)
-                floor, kinds = roadsmod.tunnel_sections(s, g, sink=roadsmod.fine_tunnel_sink(ts[i], la, lo))
-                kinds = roadsmod.portal_cover(kinds, g - floor, ts[i], s)
-                if over is None:
-                    over = self._roads_over_tunnels(feats, ts)
-                kinds = roadsmod.cover_roads(xy, s, kinds, *over)
-                i0 = 0
-                while i0 < len(kinds):
-                    i1 = i0
-                    while i1 + 1 < len(kinds) and kinds[i1 + 1] == kinds[i0]:
-                        i1 += 1
-                    a = max(0, i0 - 1)          # sharing the end sample with the section before
-                    if i1 > a:
-                        out.append((str(feats.ids[i]), ts[i], xy[a:i1 + 1], floor[a:i1 + 1], int(kinds[i0])))
-                    i0 = i1 + 1
-        return out
+                    ends = grade_points(xy[[0, -1], 0], xy[[0, -1], 1], g[[0, -1]], pack)
+                slots.append(len(items))
+                items.append((i, xy, s, g, ends, roadsmod.fine_tunnel_sink(ts[i], la, lo)))
+        return slots, items
+
+    def _sink_fine_approaches(self, key, feats, plans):
+        """Lower, in place, the ground roads' plans to the mouths of a fine terrain model's street tunnels (roads.
+        fine_tunnel_group's sunk nodes: a mouth at the depth its tube needs under the street, where the model has the
+        ramp to it 1-3 m under the street only): each plan through a sunk node falls to it at roads.FINE_RAMP_GRADE,
+        and where it is still under its own height at an end, the plans joined there go on climbing from that. Only
+        this cell's plans (a ramp reaching into the next cell ends at the edge)."""
+        ts = roadsmod.tunnel_specs(feats)
+        if not any(t is not None for t in ts):
+            return [], []
+        _slots, items = self._tunnel_items(feats, ts, key)
+        nodes = roadsmod.fine_tunnel_group([(xy, s, g, ends, sink) for _i, xy, s, g, ends, sink in items])[1]
+        grade = roadsmod.FINE_RAMP_GRADE
+        sunk = {}                       # the plans lowered, by id
+        todo, steps = list(nodes), 0
+        while todo and steps < 400:
+            steps += 1
+            px, py, z = todo.pop(0)
+            pt = np.array([[px, py]], np.float64)
+            for fid, p in plans:
+                if TUNNEL_TAG in fid or fid.startswith(RAIL_TAG):
+                    continue
+                x0, y0, x1, y1 = p.bbox
+                if not (x0 <= px <= x1 and y0 <= py <= y1):
+                    continue
+                xy = np.asarray(p.xy, np.float64)[:, :2]
+                if len(xy) < 2:
+                    continue
+                a, b = xy[:-1], xy[1:]
+                ab = b - a
+                t = np.clip(((pt - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-12), 0.0, 1.0)
+                d = np.hypot(*(a + t[:, None] * ab - pt).T)
+                n = int(np.argmin(d))
+                if d[n] > roadsmod.FINE_NODE_M:
+                    continue
+                seg = np.hypot(ab[:, 0], ab[:, 1])
+                s = np.r_[0.0, np.cumsum(seg)]
+                was = np.asarray(p.z, np.float64)
+                now = np.minimum(was, z + grade * np.abs(s - (s[n] + t[n] * seg[n])))
+                if float((was - now).max()) < 0.02:
+                    continue
+                p.z = now
+                sunk[id(p)] = p
+                for at in (0, -1):          # (still sunk at its end: the roads joined there climb on)
+                    if now[at] < was[at] - 0.02:
+                        todo.append((float(xy[at, 0]), float(xy[at, 1]), float(now[at])))
+        return nodes, [(np.asarray(p.xy, np.float64)[:, :2], np.asarray(p.z, np.float64)) for p in sunk.values()]
+
+    @staticmethod
+    def _sink_fine_rails(nodes, lines, plans):
+        """Lower, in place, the railways' bed plans at the sunk mouths of a fine model's street tunnels (nodes:
+        _sink_fine_approaches'): a tram line's ground part ends where it goes into the street's tunnel, its bed
+        planned up to the park over the mouth there and a bank beside the road all along the ramp (the two tracks of
+        bul. Skobelev's at the NDK tunnel in Sofia: 1-3 m over the road beside them, 6 m at the mouth once the road
+        is sunk to it). A bed ending within FINE_RAIL_NODE_M of a sunk node goes down to it at roads.FINE_RAMP_GRADE,
+        and, a bed that does, no higher than the sunk roads beside it (lines [(xy, z)]: the plans lowered and the
+        tunnels' open sections) where it runs within FINE_RAIL_NODE_M of them."""
+        grade = roadsmod.FINE_RAMP_GRADE
+        for fid, p in plans:
+            if not fid.startswith(RAIL_TAG):
+                continue
+            xy = np.asarray(p.xy, np.float64)[:, :2]
+            if len(xy) < 2:
+                continue
+            s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+            was = np.asarray(p.z, np.float64)
+            z = was
+            for px, py, zn in nodes:
+                for at, d in ((0, s), (-1, s[-1] - s)):
+                    if math.hypot(xy[at, 0] - px, xy[at, 1] - py) <= FINE_RAIL_NODE_M:
+                        z = np.minimum(z, zn + grade * d)
+            if z is was:
+                continue                # (no mouth of its own: a line crossing over or beside the roads stays)
+            for lxy, lz in lines:
+                if len(lxy) < 2:
+                    continue
+                a, b = lxy[:-1], lxy[1:]
+                ab = b - a
+                l2 = np.maximum((ab * ab).sum(1), 1e-12)
+                for i, q in enumerate(xy):
+                    t = np.clip(((q - a) * ab).sum(1) / l2, 0.0, 1.0)
+                    d = np.hypot(*(a + t[:, None] * ab - q).T)
+                    n = int(np.argmin(d))
+                    if d[n] <= FINE_RAIL_NODE_M:
+                        z[i] = min(z[i], float(lz[n] + t[n] * (lz[n + 1] - lz[n])))
+            p.z = z
 
     def _roads_over_tunnels(self, feats, ts):
         """([ground lines (k, 2) in the frame], [carriageway half widths]) of the roads near feats' tunnels (ts:

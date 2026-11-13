@@ -167,6 +167,8 @@ def main():
             "facts_format": __import__("roads").FACTS_FORMAT, "frames": plancache.FRAMES,
             "signature": next(iter(sigs)) if sigs else None, "versions": versions[0] if versions else None,
             "bbox": [s, w, n, e], "made": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    if plancache.plans_variant():       # (made with Sofia's files: read only with them, bakepack._matches)
+        meta["variant"] = plancache.plans_variant()
     items = wr.close(meta)
     print(f"{a.out}: {items} items ({n_plans} plans, {n_facts} facts), {os.path.getsize(a.out) / 1e6:.1f} MB, "
           f"{time.time() - t0:.0f} s", flush=True)

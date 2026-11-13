@@ -83,13 +83,21 @@ def plans_format():
     import grading
     # (the grade guard, off by default, makes other plans: its own key, so that the two never mix and nobody else's
     # plans are thrown away)
-    # (and Sofia's surveyed streets, BNE_SOFIA_STREETS: plans made of other widths, never mixed with the others)
+    return f"{PLANS_FORMAT}.{roads.FACTS_FORMAT}" + (".gg1" if grading.GUARD_ON else "") + (plans_variant() or "")
+
+
+def plans_variant():
+    """The plans' Sofia variant, ".sofia<tag>r<rules>[.ft<rules>]", or None without BNE_SOFIA_STREETS / BNE_SOFIA_DTM:
+    plans made of other widths and heights, never mixed with the others (in the revisit key, and in a baked pack's meta:
+    bakepack.py)."""
+    import roads
+    # (Sofia's surveyed streets, BNE_SOFIA_STREETS: plans made of other widths)
     sofia = "".join(".sofia" + "".join(ch for ch in f"{tag}r{rules}" if ch.isalnum())
                     for _name, tag, rules in roads._sofia_key())
     import sofiadtm
     if sofiadtm.from_env() is not None:     # (a fine terrain model: its tunnels' rules, roads.FINE_TUNNEL_RULES)
         sofia += f".ft{roads.FINE_TUNNEL_RULES}"
-    return f"{PLANS_FORMAT}.{roads.FACTS_FORMAT}" + (".gg1" if grading.GUARD_ON else "") + sofia
+    return sofia or None
 
 
 FRAMES = "r10"          # the plans' frames: their planning regions' (geotiles.PLAN_Z), not an anchor's
@@ -202,9 +210,13 @@ class PlanCache:
 
     def _bake_expect(self):
         import bakepack
-        return {"bake_format": bakepack.BAKE_FORMAT, "plans_format": PLANS_FORMAT, "frames": FRAMES,
-                "signature": self.signature,
-                "versions": json.loads(json.dumps(self.persist[1][2], sort_keys=True))}
+        expect = {"bake_format": bakepack.BAKE_FORMAT, "plans_format": PLANS_FORMAT, "frames": FRAMES,
+                  "signature": self.signature,
+                  "versions": json.loads(json.dumps(self.persist[1][2], sort_keys=True))}
+        variant = plans_variant()
+        if variant:                 # (a key only while set: bakepack._matches reads a pack's missing one as None)
+            expect["variant"] = variant
+        return expect
 
     def _baked(self, key):
         """A baked pack's plans of cell key (bakepack.py: made offline for this map data and signature), or None."""

@@ -224,6 +224,19 @@ class SyncTest(unittest.TestCase):
         self.assertEqual(fetched, ["index.json", "near.bnge"])
         self.assertEqual(bakepack.find(cache, "x", good), b"y")
 
+    def test_sofia_variant_matches_only_itself(self):
+        """A pack baked with Sofia's files is read only with them, and a pack without them only without."""
+        class P:
+            def __init__(self, meta):
+                self.meta = meta
+        base = {"plans_format": 1, "signature": "w1s1"}
+        plain, sofia = P(dict(base)), P({**base, "variant": ".sofiaabr1"})
+        self.assertTrue(bakepack._matches(plain, dict(base)), "no Sofia files, plain pack")
+        self.assertFalse(bakepack._matches(sofia, dict(base)), "no Sofia files, Sofia pack")
+        self.assertTrue(bakepack._matches(sofia, {**base, "variant": ".sofiaabr1"}), "Sofia files, Sofia pack")
+        self.assertFalse(bakepack._matches(plain, {**base, "variant": ".sofiaabr1"}), "Sofia files, plain pack")
+        self.assertFalse(bakepack._matches(sofia, {**base, "variant": ".sofiaxyr2"}), "other Sofia data")
+
 
 if __name__ == "__main__":
     unittest.main()

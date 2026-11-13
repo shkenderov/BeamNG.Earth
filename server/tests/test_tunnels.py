@@ -359,6 +359,49 @@ class TwinTunnels(unittest.TestCase):
         self.assertLess(float(P[:, 1].min()), -5.5)     # the walls outside both carriageways
         self.assertGreater(float(P[:, 1].max()), 9.5 + 5.5)
 
+    def partly(self):
+        """Side by side (8 m) for 200 m, then 30 m apart for 200 m more: the NDK tunnel's carriageways in Sofia."""
+        sp = Spec(6.5, "paved", False, "primary")
+        a = ("a", sp, np.array([[0.0, 0.0], [400.0, 0.0]]), np.array([10.0, 10.0]), 0.0)
+        b = ("b", sp, np.array([[0.0, 8.0], [200.0, 8.0], [230.0, 30.0], [400.0, 30.0]]), np.full(4, 10.0), 0.0)
+        return [a, b]
+
+    def test_twins_along_a_part_get_their_own_tubes_past_it(self):
+        parts = self.partly()
+        self.assertEqual(roads.twin_tunnels(parts), [], "the grading's twins: as before")
+        (i, j, mid, width, ri, rj), = roads.twin_tubes(parts)
+        self.assertEqual((i, j), (0, 1))
+        self.assertLess(ri[0], 1.0)
+        self.assertTrue(190.0 <= ri[1] <= 215.0 and 190.0 <= rj[1] <= 215.0, (ri, rj))
+
+        class T:
+            def parts(self, cells, exact):
+                return parts
+        ch = roads._tunnel_chunks(T(), [], (-50.0, -50.0, 500.0, 300.0))
+        own = [c for c in ch if c.get("tunnel") and c.get("deck") and not c.get("no_tube")]
+        self.assertEqual(len({round(c["n"][-1][1]) for c in own}), 2, "both carriageways' own tubes past the shared one")
+        for c in own:           # ... from where the shared one ends (a bulkhead there) to their mouths
+            self.assertGreater(c["n"][0][0], 185.0)
+        self.assertEqual(sum(bool((c.get("bulkhead") or [False])[0]) for c in own), 2)
+        self.assertEqual(sum(bool(c["portal"][1]) for c in own if c["n"][-1][0] > 399.0), 2)
+        twin, = [c for c in ch if c.get("tube_only")]
+        self.assertEqual(twin["portal"], [True, False], "the shared tube: a mouth at the twins' start only")
+        # every metre of both floors lies in a tube
+        for line in (parts[0][2], parts[1][2]):
+            s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(line, axis=0).T))]
+            for t in np.arange(5.0, s[-1] - 5.0, 10.0):
+                q = np.array([np.interp(t, s, line[:, 0]), np.interp(t, s, line[:, 1])])
+                inside = False
+                for c in ch:
+                    if not c.get("tunnel") or c.get("no_tube"):
+                        continue
+                    n = np.asarray(c["n"])[:, :2]
+                    d = roads._seg_dist(q[None], n[:-1], n[1:]).min()
+                    inside = inside or d <= c["w"] / 2 + roadmesh.TUNNEL_SHOULDER
+                self.assertTrue(inside, (t, q))
+        plain = roadmesh.tunnel([dict(c, bulkhead=None) for c in ch], (0.0, 0.0, 0.0))
+        self.assertGreater(len(roadmesh.tunnel(ch, (0.0, 0.0, 0.0))[1]), len(plain[1]), "the bulkheads' faces")
+
     def test_holes_round_both_and_their_mouths(self):
         parts = self.parts()
         n, sq = 128, 2.0

@@ -2116,6 +2116,8 @@ LOW_CAP_MIN = 1.0          # m: a stone top shorter than this (a road just behin
 LOW_CAP_M = 7.0            # m a low arch's stone top runs back from its portal face over the mouth: the terrain there
                            # dips to the floor and is cut away (roads.arch_raise, LOW_HOLE_M + LOW_HOLE_STEP): from
                            # above a row of dark terrain teeth behind the face (79th Street Transverse, 2026-10-17)
+BULKHEAD_SIDE = 2.5        # m a bulkhead (tunnel: a twin's own tube meeting the tube round both) reaches beside its
+BULKHEAD_UP = 0.2          # opening, and over its vault's top (flat: under the soil kept over the vault)
 TUNNEL_OVERLAP = 0.25      # m a tube piece reaches past a tile edge
 TUNNEL_LIGHT = "bne_tunnel_light"   # the lamps' emissive material (levels/beamng_earth/art/shapes/beamngEarth)
 TUNNEL_LAMP_EVERY = 6.0    # m between the lamp fixtures along each wall ...
@@ -2330,6 +2332,29 @@ def tunnel(chunks, origin, walls=()):
             if low and (cap_m is None or cap_m >= LOW_CAP_MIN):
                 nv = _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, float(np.max(o[:, 0])), float(o[:, 1].max()), th, origin,
                                LOW_CAP_M if cap_m is None else min(LOW_CAP_M, float(cap_m)), 2 if stone else 0)
+        # a bulkhead: where a twin's own tube meets the tube round both twins (roads._twin_pieces), a wall round its
+        # opening across that wider tube, seen from both sides (without it the sky showed between the tubes' outlines:
+        # the terrain over a tunnel is not drawn from below)
+        for end, at in zip(c.get("bulkhead") or (False, False), (0, k - 1)):
+            if not end:
+                continue
+            inner = rows[:, at]
+            o = sec.copy()
+            o[:, 0] = np.sign(o[:, 0]) * (np.abs(o[:, 0]) + BULKHEAD_SIDE)
+            o[:, 1] = np.where(o[:, 1] > 0.0, th + BULKHEAD_UP, -0.3)
+            outer = np.empty((m, 3))
+            outer[:, :2] = mid[at] + u[at] * o[:, :1]
+            outer[:, 2] = z[at] + o[:, 1]
+            outer -= origin
+            P.append(np.concatenate([inner, outer]))
+            sc = STONE_UV_M if stone else 4.0
+            UV.append(np.column_stack((np.concatenate((sec[:, 0], o[:, 0])) / sc, np.concatenate((sec[:, 1], o[:, 1])) / sc)))
+            i = np.arange(m - 1)
+            A, A1, B, B1 = nv + i, nv + i + 1, nv + m + i, nv + m + i + 1
+            tri = np.concatenate([np.stack([A, B, B1], 1), np.stack([A, B1, A1], 1)])
+            T.append(np.concatenate([tri, tri[:, ::-1]]))
+            M.append(2 if stone else 0)
+            nv += 2 * m
     allm = [TUNNEL_SIDE, TUNNEL_LIGHT, TUNNEL_STONE, TUNNEL_STONE_IN, TUNNEL_SOIL, TUNNEL_INNER, WALL_SCREE]
     Tall = np.concatenate(T)
     Mall = np.concatenate([np.full(len(t), m, np.int64) for t, m in zip(T, M)]) if M else np.zeros(len(Tall), np.int64)

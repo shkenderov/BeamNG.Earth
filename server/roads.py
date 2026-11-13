@@ -7678,7 +7678,7 @@ FINE_SINK_GRADE_MIN = 0.02
 FINE_FLOOR_GRADE = 0.08
 FINE_SINK_MAX_M = 5.0
 FINE_SINK_PCT = 80
-FINE_TUNNEL_RULES = 1           # these rules' version, in the plans' key while a fine model is read (plancache)
+FINE_TUNNEL_RULES = 7           # these rules' version, in the plans' key while a fine model is read (plancache)
 
 
 def fine_tunnel_sink(spec, lat, lon):
@@ -7742,7 +7742,223 @@ def tunnel_sections(s, g, open_cover=None, full_cover=None, min_m=SECTION_MIN_M,
         f, k = fast._ef.tunnel_sections(s, g, float(FINE_EXTENT_COVER), float(fc), int(min_n))
     floor, kinds = _shallow_full_low(s, g, np.asarray(f), np.asarray(k))
     if sink is not None:
+        under = _fine_under_street(s, g, float(sink)) if np.asarray(kinds).any() else None
+        if under is not None:
+            return under
+        floor, kinds = _fine_one_run(s, g, floor, kinds)
         floor = _sunk_floor(s, g, floor, kinds, float(sink))
+    return floor, kinds
+
+
+FINE_RAMP_GRADE = 0.10          # a street tunnel's floor falls this steeply from its mapped ends (its ramps) ...
+FINE_STREET_WIN_M = 15.0        # the street's level over it: the ground's highest within this, then its mean
+FINE_FIT_SHARE = 0.4            # ... and it is built under the street (_fine_under_street) when the tube fits under
+                                # it along this share of its length (a short underpass: as before, _fine_one_run)
+
+
+def _fine_under_street(s, g, sink):
+    """(floor, kinds) of a street tunnel on a fine terrain model with its tube wholly under the street, or None where
+    it does not fit (FINE_FIT_SHARE). The player, 2026-11-12, of the tunnel under the NDK's park in Sofia: "the tunnel
+    is so tall or so up that it [wrecked] the ground above and the entrances": with its mouths where the model has
+    the ramps (1-3 m under the park, the road is 5-6 m down there) the 5 m tube stood out of the ground for 80 m from
+    each mouth, the park raised over it in mounds up to 6 m high (arch_raise). Here the ground over a covered run
+    is never raised: the floor follows the street's level (FINE_STREET_WIN_M) `sink` under it, falling to that from
+    the mapped ends at FINE_RAMP_GRADE; it is covered between the first and the last sample where the tube and
+    ARCH_SOIL_MIN of soil fit under the ground (pools in between: covered), and what is before and after is an open
+    ramp cut into the ground (grading._open_tunnels): the mouths lie that far in from the mapped ones. Pure."""
+    n = len(s)
+    if n < 3:
+        return None
+    hull = _lower_hull(s, g)
+    street = _fine_street(s, g)
+    ramps = np.maximum(g[0] - FINE_RAMP_GRADE * s, g[-1] - FINE_RAMP_GRADE * (s[-1] - s))
+    floor = np.minimum(hull, np.maximum(street - sink, ramps))
+    fit = np.flatnonzero(g - floor >= sink - TUNNEL_SOIL_M + ARCH_SOIL_MIN - 0.05)
+    if not len(fit) or s[fit[-1]] - s[fit[0]] < max(SECTION_MIN_M, FINE_FIT_SHARE * float(s[-1])):
+        return None
+    a, b = int(fit[0]), int(fit[-1])
+    # (a mapped end at depth, the tube fitting from the next sample on: the mouth is there, its approach sunk to it
+    # outside the tunnel, fine_tunnel_group; the end's own ground is the road's)
+    a = 0 if a == 1 else a
+    b = n - 1 if b == n - 2 else b
+    kinds = np.zeros(n, np.int64)
+    kinds[a:b + 1] = 1
+    return floor, kinds
+
+
+def _fine_street(s, g):
+    """The street's level over a tunnel's samples: the ground's highest within FINE_STREET_WIN_M (a pool's bed, a
+    ramp's trench at a mouth: not the street), then its mean over the same. Pure."""
+    win = [(s >= s[i] - FINE_STREET_WIN_M) & (s <= s[i] + FINE_STREET_WIN_M) for i in range(len(s))]
+    top = np.array([g[w].max() for w in win])
+    return np.array([top[w].mean() for w in win])
+
+
+FINE_NODE_M = 1.0               # tunnel parts' ends (and a road's line) within this are one node
+FINE_APPROACH_MIN_M = 0.3       # a mouth wanted less than this under the ground at a mapped end: left as it is
+FINE_APPROACH_MAX_M = 6.5       # ... and at most this far under it
+FINE_SPLIT_CLEAR_M = 10.0       # a tunnel parting from an open road at a node is open while its line is this near
+FINE_SPLIT_MAX_M = 40.0         # that road's (its tube in the road's cut), this far from the node at most
+
+
+def fine_model_on():
+    """Is a fine terrain model read (sofiadtm: BNE_SOFIA_DTM)?"""
+    import sofiadtm
+    return sofiadtm.from_env() is not None
+
+
+def fine_tunnel_group(items):
+    """The tunnel parts of one place solved together: items [(xy (k, 2), s, g, ends, sink)], g the ungraded ground
+    at arc lengths s, ends the ground at the part's two ends as the roads' plans grade it, sink fine_tunnel_sink's
+    (None: no street tunnel on a fine model). -> ([(floor, kinds, ground used)] per item, [(x, y, z)] sunk nodes).
+    Without a fine model's street tunnel among them: tunnel_sections of each, as before, and no nodes.
+
+    A street tunnel on a fine model has its mouths where the map has them, at the depth its tube needs under the
+    street there (the player, 2026-11-12: "do the fix": with the mouths at the ground's level, 1-3 m under the park
+    where the road is 5-6 m down, the tube stood out of the ground, or its ramps were cut 25-60 m into the park).
+    Each end of such a part wants the street's level (_fine_street) less its sink, where that is FINE_APPROACH_MIN_M
+    or more under the ungraded ground there (at most FINE_APPROACH_MAX_M): its node is sunk to the lowest want of
+    the parts ending there. From a sunk node
+    - the grading lowers the ground roads' plans through it, FINE_RAMP_GRADE up from it (grading.
+      _sink_fine_approaches, with the nodes returned here): `ends` then has the part's end at that depth;
+    - a part that is an open road (a 'tunnel' in the map that is none, joined to the tunnel: the roads between the
+      NDK tunnel's east mouths and the street) falls to it at FINE_RAMP_GRADE, and where it is too short to climb
+      back to its own level, its other end's node is sunk with it;
+    - a part ending there with another tunnel part (no road's plan knows the node) takes its depth as its end's
+      ground.
+    The same in the grading (grading._tunnel_sections) and the meshes (TunnelProfiles._solve): from the ungraded
+    ground alone but for `ends`. Pure."""
+    def plain(it):
+        xy, s, g, ends, sink = it
+        ge = np.array(g, np.float64)
+        ge[0], ge[-1] = ends[0], ends[-1]
+        return ge
+    if not any(it[4] is not None for it in items):
+        out = []
+        for it in items:
+            ge = plain(it)
+            floor, kinds = tunnel_sections(it[1], ge)
+            out.append((floor, kinds, ge))
+        return out, []
+    nk = _EndJoin(FINE_NODE_M)
+    at_node, where, deg = [], {}, {}
+    for xy, *_ in items:
+        a, b = nk(xy[0]), nk(xy[-1])
+        at_node.append((a, b))
+        where.setdefault(a, (float(xy[0][0]), float(xy[0][1])))
+        where.setdefault(b, (float(xy[-1][0]), float(xy[-1][1])))
+        deg[a] = deg.get(a, 0) + 1
+        deg[b] = deg.get(b, 0) + 1
+    zn, street_tunnel = {}, []
+    for (xy, s, g, _ends, sink), nodes in zip(items, at_node):
+        g = np.asarray(g, np.float64)
+        ok = sink is not None and len(s) >= 3 and bool(np.asarray(tunnel_sections(s, g, sink=sink)[1]).any())
+        street_tunnel.append(ok)
+        if not ok:
+            continue
+        street = _fine_street(s, g)
+        for node, at in zip(nodes, (0, -1)):
+            want = max(float(street[at]) - float(sink), float(g[at]) - FINE_APPROACH_MAX_M)
+            if want < float(g[at]) - FINE_APPROACH_MIN_M:
+                zn[node] = min(zn.get(node, np.inf), want)
+    base, ramped = {}, {}
+    for i, it in enumerate(items):
+        if not street_tunnel[i]:
+            ge = plain(it)
+            floor, kinds = tunnel_sections(it[1], ge, sink=it[4])
+            base[i] = (np.asarray(floor, np.float64), np.asarray(kinds), ge)
+    for _round in range(8):             # (an open part sunk at both ends, the node past it: a few parts in a row)
+        changed = False
+        for i, (floor, kinds, _ge) in base.items():
+            if kinds.any() or len(floor) < 2:
+                continue                # (a tunnel of the other rules: as it is)
+            s = np.asarray(items[i][1], np.float64)
+            f = floor.copy()
+            for node, d in zip(at_node[i], (s, s[-1] - s)):
+                if node in zn:
+                    f = np.minimum(f, zn[node] + FINE_RAMP_GRADE * d)
+            if (f < floor - 0.05).all():    # (too short to climb back to its own level: straight between its ends,
+                f = np.minimum(f, np.interp(s, s[[0, -1]], f[[0, -1]]))     # no hump in the middle)
+            ramped[i] = f
+            for node, at in zip(at_node[i], (0, -1)):
+                if f[at] < floor[at] - 0.05 and f[at] < zn.get(node, np.inf) - 1e-6:
+                    zn[node] = float(f[at])
+                    changed = True
+        if not changed:
+            break
+    open_at = {}                        # node -> the open parts ending there
+    for i, (_floor, kinds, _ge) in base.items():
+        if not kinds.any() and len(items[i][0]) >= 2:
+            for node in at_node[i]:
+                open_at.setdefault(node, []).append(i)
+    out = []
+    for i, it in enumerate(items):
+        if street_tunnel[i]:
+            ge = plain(it)
+            for node, at in zip(at_node[i], (0, -1)):
+                if node in zn and deg[node] > 1:
+                    ge[at] = min(ge[at], zn[node])
+            floor, kinds = tunnel_sections(it[1], ge, sink=it[4])
+            # where it parts from an open road at its end (a fork: the NDK tunnel's east mouths, the street to bul.
+            # Bulgaria's tunnel off the same node as the open road between them), it is open too until its tube
+            # is clear of that road: covered from the node, the ground kept over it stood as a 6 m wall across the
+            # open road 6 m on
+            kinds = np.array(kinds, np.int64)
+            xy = np.asarray(it[0], np.float64)[:, :2]
+            s = np.asarray(it[1], np.float64)
+            for node, d in zip(at_node[i], (s, s[-1] - s)):
+                for j in open_at.get(node, ()):
+                    oxy = np.asarray(items[j][0], np.float64)[:, :2]
+                    dist, q = _line_near(xy, oxy)
+                    # (beside the road, not before its end: a tunnel the open road goes on from stays covered)
+                    near = (dist < FINE_SPLIT_CLEAR_M) & (np.hypot(*(q - np.asarray(where[node])).T) > 0.5)
+                    near[np.argmin(d)] = near.any()     # (its own end sample at the node, with the next ones)
+                    for n in np.argsort(d, kind="stable"):
+                        if not near[n] or d[n] > FINE_SPLIT_MAX_M:
+                            break
+                        kinds[n] = 0
+            out.append((floor, kinds, ge))
+        else:
+            floor, kinds, ge = base[i]
+            out.append((ramped.get(i, floor), kinds, ge))
+    return out, [(where[n][0], where[n][1], float(z)) for n, z in sorted(zn.items())]
+
+
+def _lower_hull(s, g):
+    """The lower convex hull of (s, g) at s. Pure."""
+    idx = []
+    for i in range(len(s)):
+        while len(idx) >= 2:
+            a, b = idx[-2], idx[-1]
+            if (g[b] - g[a]) * (s[i] - s[a]) >= (g[i] - g[a]) * (s[b] - s[a]):
+                idx.pop()
+            else:
+                break
+        idx.append(i)
+    return np.interp(s, s[idx], g[idx])
+
+
+def _fine_one_run(s, g, floor, kinds):
+    """(floor, kinds) of a street tunnel on a fine terrain model (tunnel_sections with a sink) as one covered run:
+    an open gap between two covered runs is covered: a street tunnel has no open stretch inside it, the ground dips
+    there for another reason (the fountains of the NDK's square lie on the tunnel under it, their pools carved 2 m
+    into the ground: 31 m of one carriageway were an open road in a trench in the middle of the tunnel, no tube
+    round it and the pools' water in it, 2026-11-12). The floor of what is covered now: the hull's, as the covered
+    runs'. (A short underpass, where _fine_under_street's tube does not fit.) Pure."""
+    kinds = np.array(kinds, np.int64)
+    cov = np.flatnonzero(kinds > 0)
+    if not len(cov) or len(cov) == len(kinds):
+        return floor, kinds
+    first, last = int(cov[0]), int(cov[-1])
+    add = np.zeros(len(kinds), bool)
+    add[first:last + 1] = kinds[first:last + 1] == 0
+    if not add.any():
+        return floor, kinds
+    gap = add & (kinds == 0)
+    for i in np.flatnonzero(gap):               # (a gap: the kind of the covered run before it)
+        kinds[i] = kinds[i - 1]
+    floor = np.array(floor, np.float64)
+    floor[add] = _lower_hull(s, g)[add]
     return floor, kinds
 
 
@@ -7925,15 +8141,30 @@ class TunnelProfiles(BridgeProfiles):
         for a, b in jends.values():
             jdeg[a] = jdeg.get(a, 0) + 1
             jdeg[b] = jdeg.get(b, 0) + 1
+        pre = {}                        # part -> (xy, s, its ungraded ground, its ends' ground, fine_tunnel_sink)
         for k in comp:
             xy = np.asarray(pool[k][1], np.float64)
             if len(xy) < 2:
-                out.append(np.full(len(xy), np.nan))
                 continue
             s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
             g = np.asarray(gfn(xy), np.float64)
             underwater = k in underwater_floors
             ge = g[[0, -1]] if underwater else np.asarray(self._ends_ground(xy[[0, -1]]), np.float64)
+            sink = None
+            if not underwater:
+                la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.)
+                sink = fine_tunnel_sink(pool[k][0], la, lo)
+            pre[k] = (xy, s, g, ge, sink)
+        together = {}                   # (a fine model's street tunnels: with the parts joined to them)
+        if any(v[4] is not None for v in pre.values()):
+            keys = [k for k in pre if k not in underwater_floors]
+            together = dict(zip(keys, fine_tunnel_group([pre[k] for k in keys])[0]))
+        for k in comp:
+            if k not in pre:
+                out.append(np.full(len(pool[k][1]), np.nan))
+                continue
+            xy, s, g, ge, sink = pre[k]
+            underwater = k in underwater_floors
             g = g.copy()
             g[0], g[-1] = ge[0], ge[-1]
             if underwater:
@@ -7945,9 +8176,12 @@ class TunnelProfiles(BridgeProfiles):
                 cover_ground = np.where(np.asarray(d) > .5, np.maximum(g, lz), g)
                 kinds = np.where(cover_ground - floor >= TUNNEL_COVER - .02, 2, 0)
             else:
-                la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.)
-                floor, kinds = tunnel_sections(s, g, sink=fine_tunnel_sink(pool[k][0], la, lo))
-                kinds = portal_cover(kinds, g - floor, pool[k][0], s)
+                if k in together:
+                    floor, kinds, g = together[k]
+                else:
+                    floor, kinds = tunnel_sections(s, g, sink=sink)
+                if sink is None:        # (a fine model's street tunnel: its open ramps stay open, _fine_under_street)
+                    kinds = portal_cover(kinds, g - floor, pool[k][0], s)
                 kinds = self._cover_roads(xy, s, kinds, ground)
             secs, i = [], 0
             while i < len(kinds):
@@ -8525,8 +8759,13 @@ def tunnel_hole_mask(parts, u, cx, cy, square, heights=None, mouths=None):
     # covering what is above)
     parts = list(parts)
     n_own = len(parts)
-    parts += [(parts[i][0], parts[i][1]._replace(width=w), mid[:, :2], mid[:, 2], parts[i][4])
-              for i, j, mid, w in twin_tunnels([p for p in parts if np.isfinite(np.asarray(p[3])).all()]) if len(mid) >= 2]
+    fin = [p for p in parts if np.isfinite(np.asarray(p[3])).all()]
+    twin_ends = {}              # index in parts -> (the tube round both ends at its first twin's start, at its end)
+    for i, j, mid, w, ri, _rj in twin_tubes(fin):
+        if len(mid) >= 2:
+            li = float(np.hypot(*np.diff(np.asarray(fin[i][2], np.float64)[:, :2], axis=0).T).sum())
+            twin_ends[len(parts)] = (ri[0] < TWIN_OWN_MIN_M, li - ri[1] < TWIN_OWN_MIN_M)
+            parts.append((fin[i][0], fin[i][1]._replace(width=w), mid[:, :2], mid[:, 2], fin[i][4]))
     fast.require(88, "tunnel_holes")
     u = np.ascontiguousarray(u, np.float64)
     for k_, (_fid, spec, xy, z, _lon) in enumerate(parts):
@@ -8537,8 +8776,10 @@ def tunnel_hole_mask(parts, u, cx, cy, square, heights=None, mouths=None):
         hw = spec.width / 2 + roadmesh.TUNNEL_SHOULDER + TUNNEL_HOLE_MARGIN
         th = (heights or {}).get(_fid, roadmesh.TUNNEL_H)       # heights: a low arch's tube (TunnelProfiles.heights)
         low = th < roadmesh.TUNNEL_H - 0.05
+        e0, e1 = twin_ends.get(k_, (True, True))    # (a tube round twins that ends inside them: no mouth there)
         if k_ >= n_own and not low:     # a twin tube's mouths, whatever the height (the low arches' cut, no side reach)
             m0, m1 = (mouths or {}).get(_fid, (True, True))
+            m0, m1 = m0 and e0, m1 and e1
             mouth_mask = np.zeros(u.shape, bool)
             fast._ef.tunnel_holes(mouth_mask, u, float(x0), float(y0), float(square), np.ascontiguousarray(xy),
                                   np.ascontiguousarray(z), float(hw), float(th), True, bool(m0), bool(m1),
@@ -8546,6 +8787,7 @@ def tunnel_hole_mask(parts, u, cx, cy, square, heights=None, mouths=None):
             mask |= mouth_mask
         # the Rust kernel: the samples over the part between its floor and vault (a low arch: its mouths only)
         m0, m1 = (mouths or {}).get(_fid, (True, True))
+        m0, m1 = m0 and e0, m1 and e1
         # (a low arch: the squares from its flat mouth band, LOW_HOLE_M, up to the soil over its vault)
         fast._ef.tunnel_holes(mask, u, float(x0), float(y0), float(square), np.ascontiguousarray(xy),
                               np.ascontiguousarray(z), float(hw), float(th), bool(low), bool(m0), bool(m1),
@@ -9354,10 +9596,25 @@ def _line_near(xy, other):
     return out_d, out_q
 
 
+TWIN_PART_SHARE = 0.5   # twins along a part of them too (twin_tubes): side by side without a break for this share of
+TWIN_PART_MIN_M = 30.0  # the shorter one's length, this long at least
+TWIN_OWN_MIN_M = 12.0   # m of a twin outside the tube round both from which it gets a tube of its own (_twin_pieces)
+
+
 def twin_tunnels(parts):
     """Pairs of tunnel parts ([(fid, spec, xy, z, lon)]) side by side: [(i, j, midline (k, 3), width)] with i < j their
     indices, the midline along part i (each point halfway to j's line, the floors' mean) and the width of a road
     surface covering both carriageways (the tube round both: roadmesh.tunnel). Each part in one pair at most. Pure."""
+    return [t[:4] for t in twin_tubes(parts, partial=False)]
+
+
+def twin_tubes(parts, partial=True):
+    """twin_tunnels' pairs with the stretch of each part inside the tube round both: [(i, j, midline, width, (a0, a1),
+    (b0, b1))], arc lengths along part i and along part j. partial: also parts side by side along a part of them
+    only (TWIN_PART_*: the carriageways of the tunnel under Sofia's NDK run 12 m apart at its west mouth and part again
+    at its east one, 77 % of it side by side: no twins, each in a tube of its own through the other's lanes; and
+    where they were twins, both floors were left without a tube outside the stretch they share, 2026-11-12): the
+    midline is that stretch's, the rest of each part gets its own tube (_twin_pieces). Pure."""
     import roadmesh
     taken, out = set(), []
     for i, (fa, sa, xa, za, _) in enumerate(parts):
@@ -9384,8 +9641,18 @@ def twin_tunnels(parts):
             reach = (sa.width + sb.width) / 2 + 2 * roadmesh.TUNNEL_SHOULDER + 1.0      # their tubes would overlap
             d, q = _line_near(P, xb)
             near = d < reach
-            if near.mean() < TWIN_SHARE:
-                continue
+            whole = near.mean() >= TWIN_SHARE
+            if not whole:
+                if not partial or not near.any():
+                    continue
+                # the longest stretch side by side without a break
+                edges = np.flatnonzero(np.diff(np.r_[0, near.astype(np.int8), 0]))
+                r0, r1 = max(zip(edges[::2], edges[1::2] - 1), key=lambda r: ss[r[1]] - ss[r[0]])
+                tb_len = float(np.hypot(*np.diff(xb, axis=0).T).sum())
+                if ss[r1] - ss[r0] < max(TWIN_PART_MIN_M, TWIN_PART_SHARE * min(float(sj[-1]), tb_len)):
+                    continue
+                near = np.zeros(len(near), bool)
+                near[r0:r1 + 1] = True
             tb = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xb, axis=0).T))]
             _, qb = _line_near(q, xb)           # (q on xb: its floor by the arc to it)
             sb_at = np.array([tb[k] + np.hypot(*(qb[n] - xb[k])) for n, k in enumerate(
@@ -9396,9 +9663,40 @@ def twin_tunnels(parts):
             mid = np.c_[(P + q) / 2, (Z + zq) / 2]
             k0, k1 = int(np.flatnonzero(near)[0]), int(np.flatnonzero(near)[-1])     # (where they run side by side)
             width = float(np.median(d[near])) + (sa.width + sb.width) / 2
-            out.append((i, j, mid[k0:k1 + 1], width))
+            b0, b1 = sorted((float(sb_at[k0]), float(sb_at[k1])))
+            out.append((i, j, mid[k0:k1 + 1], width, (float(ss[k0]), float(ss[k1])), (b0, b1)))
             taken.update((i, j))
             break
+    return out
+
+
+def _twin_pieces(pts, rng):
+    """A tunnel part's floor line pts (k, 3) as [(line, no_tube, cuts)]: all of it with its own tube (rng None: no
+    twin), else the stretch rng (arc lengths a0, a1: twin_tubes') inside the tube round both twins ("no_tube") and
+    what lies before and after it, TWIN_OWN_MIN_M or more, each with a tube of its own; cuts: the (x, y) where a
+    piece with its own tube meets the tube round both (a bulkhead round its opening there: roadmesh.tunnel). Pure."""
+    pts = np.asarray(pts, np.float64)
+    if rng is None or len(pts) < 2:
+        return [(pts, False, ())]
+    s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(pts[:, :2], axis=0).T))]
+    a0, a1 = float(rng[0]), float(rng[1])
+    a0 = 0.0 if a0 < TWIN_OWN_MIN_M else a0
+    a1 = float(s[-1]) if s[-1] - a1 < TWIN_OWN_MIN_M else a1
+    if a1 - a0 < 1.0:
+        return [(pts, False, ())]
+
+    def cut(u, v):
+        at = lambda t: np.array([np.interp(t, s, pts[:, c]) for c in range(pts.shape[1])])     # noqa: E731
+        inner = pts[(s > u + 1e-6) & (s < v - 1e-6)]
+        return np.vstack([at(u), inner, at(v)])
+    out = []
+    if a0 > 0.0:
+        ln = cut(0.0, a0)
+        out.append((ln, False, (ln[-1, :2],)))
+    out.append((cut(a0, a1), True, ()))
+    if a1 < s[-1]:
+        ln = cut(a1, float(s[-1]))
+        out.append((ln, False, (ln[0, :2],)))
     return out
 
 
@@ -9407,7 +9705,9 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
     built around it, roadmesh.tunnel) and its lines, every one "fixed" at the floor's heights; a surface chunk
     ending at its part's end carries "portal": [start is one, end is one]. Twin tunnels (twin_tunnels): their surfaces
     are floors without a tube ("no_tube"), and one "tube_only" chunk along their midline (not drawn as a road) carries
-    the tube round both, with the first's portals."""
+    the tube round both, with the first's portals where it reaches the first's ends; what of a twin lies outside
+    that tube has its own (_twin_pieces), a "bulkhead" [at its start, at its end] where it meets the tube round
+    both."""
     import rampmerges, roadmarkings
     out = []
     if getattr(tunnels, "open_parts", None) is not None:
@@ -9427,26 +9727,29 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
                             out.append(_chunk(look, w, c))
     parts = [p for p in tunnels.parts(cells, exact) if np.isfinite(p[3]).all()]
     layouts = rampmerges.plans([(fid, sp, np.c_[xy, z], lon) for fid, sp, xy, z, lon in parts])
-    twins = twin_tunnels(parts)
-    twinned = {k for i, j, _, _ in twins for k in (i, j)}
-    jobs = []                                   # (fid, its ends, [(look, width, line)])
-    for i, j, mid, width in twins:              # the tube round both, with the first's portals
-        if len(mid) >= 2:
-            jobs.append((parts[i][0], (mid[0, :2], mid[-1, :2]), [({**TUNNEL, "tunnel": True, "tube_only": True}, width, mid)],
-                         parts[i][1]))
+    twins = [t for t in twin_tubes(parts) if len(t[2]) >= 2]
+    twinned = {k: r for i, j, _, _, ri, rj in twins for k, r in ((i, ri), (j, rj))}    # part -> its stretch in the tube
+    has_mouth = getattr(tunnels, "mouth", None) is not None
+    jobs = []                                   # (fid, its ends, [(look, width, line)], spec, mouths, length)
+    for i, j, mid, width, ri, rj in twins:      # the tube round both, with the first's portals where it ends with it
+        m0, m1 = tunnels.mouth(parts[i][0]) if has_mouth else (True, True)
+        li = float(np.hypot(*np.diff(np.asarray(parts[i][2], np.float64)[:, :2], axis=0).T).sum())
+        jobs.append((parts[i][0], (mid[0, :2], mid[-1, :2]), [({**TUNNEL, "tunnel": True, "tube_only": True}, width, mid)],
+                     parts[i][1], (bool(m0 and ri[0] < TWIN_OWN_MIN_M), bool(m1 and li - ri[1] < TWIN_OWN_MIN_M)),
+                     float(np.hypot(*np.diff(mid[:, :2], axis=0).T).sum())))
     for n, (fid, spec, xy, z, lon) in enumerate(parts):
         pts = np.c_[xy, z]
         # A covered road needs its own colliding floor even when its mapped surface normally belongs to the
         # terrain paint (rock/grass). That paint lies on the hill/seabed above the bore, never inside it.
         look = _deck_look(spec)
-        lines = [] if look is None else [({**look, "deck": True, "tunnel": True, "no_tube": n in twinned}, spec.width, pts)]
+        lines = [] if look is None else [({**look, "deck": True, "tunnel": True, "no_tube": no_tube, "_bulk": cuts},
+                                          spec.width, ln) for ln, no_tube, cuts in _twin_pieces(pts, twinned.get(n))]
         for look, w, line in rampmerges.trim(fid, extras(spec, pts, lon, defer_dashes=True), layouts):
             if look["m"] not in (SIDEWALK["m"], GUTTER["m"], EDGE_DECAL["m"]):     # (no ground beside a deck)
                 lines.append((look, w, line))
-        jobs.append((fid, (pts[0, :2], pts[-1, :2]), lines, spec))
-    for fid, ends, lines, spec in jobs:
-        length = max((float(np.hypot(*np.diff(np.asarray(ln)[:, :2], axis=0).T).sum()) for _, _, ln in lines
-                      if len(ln) >= 2), default=0.0)
+        jobs.append((fid, (pts[0, :2], pts[-1, :2]), lines, spec, tunnels.mouth(fid) if has_mouth else (True, True),
+                     float(np.hypot(*np.diff(pts[:, :2], axis=0).T).sum())))
+    for fid, ends, lines, spec, (m0, m1), length in jobs:
         for look, w, line in lines:
             guard = None
             if look.get("tunnel") and getattr(tunnels, "frame", None) is not None:
@@ -9487,10 +9790,13 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
                                 if c0 is not None or c1 is not None:
                                     atc = lambda p: c0 if np.hypot(*(p - ends[0])) < 0.5 else c1    # noqa: E731
                                     ch["cap_m"] = [atc(c[0, :2]), atc(c[-1, :2])]
-                            m0, m1 = tunnels.mouth(fid) if getattr(tunnels, "mouth", None) is not None else (True, True)
                             isp = lambda p: bool((np.hypot(*(p - ends[0])) < 0.5 and m0) or      # noqa: E731
                                                  (np.hypot(*(p - ends[1])) < 0.5 and m1))
                             ch["portal"] = [isp(c[0, :2]), isp(c[-1, :2])]
+                            cuts = look.get("_bulk") or ()
+                            bulk = [any(np.hypot(*(p - q)) < 0.5 for q in cuts) for p in (c[0, :2], c[-1, :2])]
+                            if any(bulk):               # (its own tube meets the tube round both twins here)
+                                ch["bulkhead"] = bulk
                         out.append(ch)
     out.extend(rampmerges.chunks(layouts, exact, fixed=True))
     return roadmarkings.paint(out)

@@ -36,9 +36,12 @@ def meta_for(md, signature, frames):
     """The meta a pack made with map data md and plans signature / frames carries (and a reader expects)."""
     import plancache
     import roads
-    return {"bake_format": BAKE_FORMAT, "plans_format": plancache.PLANS_FORMAT, "facts_format": roads.FACTS_FORMAT,
+    meta = {"bake_format": BAKE_FORMAT, "plans_format": plancache.PLANS_FORMAT, "facts_format": roads.FACTS_FORMAT,
             "frames": frames, "signature": signature,
             "versions": json.loads(json.dumps(md.versions(), sort_keys=True)) if md is not None else None}
+    if plancache.plans_variant():
+        meta["variant"] = plancache.plans_variant()
+    return meta
 
 
 class Writer:
@@ -122,7 +125,8 @@ def packs(cache_dir):
 
 def _matches(pack, expect):
     m = pack.meta
-    return all(m.get(k) == v for k, v in expect.items())
+    # (a pack made with Sofia's files is read only with them, and the other way round: "variant", plancache.plans_variant)
+    return all(m.get(k) == v for k, v in expect.items()) and m.get("variant") == expect.get("variant")
 
 
 def find(cache_dir, key, expect):
@@ -157,9 +161,12 @@ _sync = {"at": -1e9, "busy": False}
 def _expect_for(md, signature):
     import plancache
     import roads
-    return {"bake_format": BAKE_FORMAT, "plans_format": plancache.PLANS_FORMAT, "facts_format": roads.FACTS_FORMAT,
-            "frames": plancache.FRAMES, "signature": signature,
-            "versions": json.loads(json.dumps(md.versions(), sort_keys=True))}
+    expect = {"bake_format": BAKE_FORMAT, "plans_format": plancache.PLANS_FORMAT, "facts_format": roads.FACTS_FORMAT,
+              "frames": plancache.FRAMES, "signature": signature,
+              "versions": json.loads(json.dumps(md.versions(), sort_keys=True))}
+    if plancache.plans_variant():
+        expect["variant"] = plancache.plans_variant()
+    return expect
 
 
 def _get(net, url, path, cap):
