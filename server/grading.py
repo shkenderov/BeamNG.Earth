@@ -1957,6 +1957,20 @@ def _twin_trimmed(secs):
 _UNSET = object()
 
 
+def tunnel_samples(xy, fine):
+    """(points (k, 2), arc lengths) a tunnel part (xy: its line in the frame's metres) is solved at in the grading.
+    On a fine terrain model (fine: roads.fine_model_on) the samples the meshes' profile takes it at
+    (roads.TunnelProfiles: the map's vertices, densified to roads.DECK_STEP): a model of 1 m has a trench or a pit at a
+    mouth only a few metres wide, and a point every VERTEX_STEP from the start fell elsewhere than the profile's, so the
+    two solved different sections and floors (the open ramp 21 m long here, 8 m there: the road drawn on the grading's
+    ground 3-5 m from the tube it leaves, Sofia 2026-11-13). Elsewhere a point every VERTEX_STEP as before. Pure."""
+    xy = np.asarray(xy, np.float64)[:, :2]
+    if not fine:
+        return resample(xy, VERTEX_STEP)
+    xy = roadsmod.densify(roadsmod._dedupe(xy), roadsmod.DECK_STEP)
+    return xy, np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+
+
 class _Planner:
     """The road plans of one planning region (geotiles.PLAN_Z), in its frame, per map cell, made once (worker threads;
     it fetches the road cells it lacks). store: the PlanStore it belongs to (its other regions, its settings)."""
@@ -4860,7 +4874,7 @@ class _Planner:
                         slots.append(solved)
                         continue
                 E, N, _ = self.frame.geodetic_to_enu(ll[:, 1], ll[:, 0], 0.0)
-                xy, s = resample(np.stack([np.asarray(E), np.asarray(N)], axis=1), VERTEX_STEP)
+                xy, s = tunnel_samples(np.stack([np.asarray(E), np.asarray(N)], axis=1), roadsmod.fine_model_on())
                 if len(xy) < 2 or s[-1] <= 0:
                     continue
                 la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
@@ -4873,7 +4887,11 @@ class _Planner:
                 ends = g[[0, -1]]
                 if road_plans:
                     pack = PlanPack(list(road_plans)) if pack is None else pack
-                    ends = grade_points(xy[[0, -1], 0], xy[[0, -1], 1], g[[0, -1]], pack)
+                    # (the meshes' profile reads its ends through Grader.apply with ROAD_LIFT, TunnelProfiles.ends: 4 cm
+                    # that put a section's end one sample further in or out here than there, a fine model's rules
+                    # deciding on thresholds of centimetres)
+                    ends = grade_points(xy[[0, -1], 0], xy[[0, -1], 1], g[[0, -1]], pack,
+                                        ROAD_LIFT if roadsmod.fine_model_on() else 0.0)
                 slots.append(len(items))
                 items.append((i, xy, s, g, ends, roadsmod.fine_tunnel_sink(ts[i], la, lo)))
         return slots, items

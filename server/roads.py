@@ -7732,7 +7732,7 @@ FINE_SINK_GRADE_MIN = 0.02
 FINE_FLOOR_GRADE = 0.08
 FINE_SINK_MAX_M = 5.0
 FINE_SINK_PCT = 80
-FINE_TUNNEL_RULES = 7           # these rules' version, in the plans' key while a fine model is read (plancache)
+FINE_TUNNEL_RULES = 8           # these rules' version, in the plans' key while a fine model is read (plancache)
 
 
 def fine_tunnel_sink(spec, lat, lon):
