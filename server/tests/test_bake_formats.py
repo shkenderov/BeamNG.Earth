@@ -151,6 +151,30 @@ class PackTest(unittest.TestCase):
         self.assertIsNone(bakepack.find(self.dir, "a", {"x": 2}), "another meta: not read")
         self.assertIsNone(bakepack.find(self.dir, "zz", {"x": 1}))
 
+    def test_facts_of_a_pack_with_a_variant(self):
+        """A pack made with Sofia's files gives its facts to a run with them (as its plans: plancache._bake_expect), and
+        to no other run."""
+        from unittest import mock
+        import revisit
+        versions = {"overture": "r1"}
+        os.makedirs(os.path.join(self.dir, bakepack.SUBDIR))
+        w = bakepack.Writer(os.path.join(self.dir, bakepack.SUBDIR, "s" + bakepack.SUFFIX))
+        w.add(bakepack.facts_key("ranges", None, "14/1/2"), b"[1]")
+        w.close({"bake_format": bakepack.BAKE_FORMAT, "facts_format": roads.FACTS_FORMAT, "versions": versions,
+                 "variant": ".sofiaabr1"})
+
+        class Feats:
+            pass
+        f = Feats()
+        f._bnge_cell = ("14/1/2", None, json.dumps(versions))
+        with mock.patch.object(revisit, "CACHE_DIR", self.dir):
+            with mock.patch.object(plancache, "plans_variant", lambda: ".sofiaabr1"):
+                self.assertEqual(roads._facts_baked(f, "ranges", None), b"[1]", "the same files: read")
+            with mock.patch.object(plancache, "plans_variant", lambda: None):
+                self.assertIsNone(roads._facts_baked(f, "ranges", None), "no Sofia files: not read")
+            with mock.patch.object(plancache, "plans_variant", lambda: ".sofiaxyr2"):
+                self.assertIsNone(roads._facts_baked(f, "ranges", None), "other Sofia data: not read")
+
     def test_a_run_reads_baked_plans(self):
         f = fixture()
         la, lo, _ = FRAME.enu_to_geodetic(np.linspace(-200, 200, 50), np.linspace(-30, 60, 50), 0.0)

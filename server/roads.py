@@ -546,8 +546,12 @@ def _facts_baked(feats, kind, extra):
         versions = json.loads(cid[2])
     except (ValueError, IndexError, TypeError):
         return None
-    return bakepack.find(revisit.CACHE_DIR, bakepack.facts_key(kind, extra, cid[0]),
-                         {"bake_format": bakepack.BAKE_FORMAT, "facts_format": FACTS_FORMAT, "versions": versions})
+    expect = {"bake_format": bakepack.BAKE_FORMAT, "facts_format": FACTS_FORMAT, "versions": versions}
+    import plancache
+    variant = plancache.plans_variant()
+    if variant:     # (as plancache._bake_expect: bakepack._matches reads a pack's variant against this one, a missing one
+        expect["variant"] = variant     # as None, so a pack made with Sofia's files never gave its facts, 2026-11-13)
+    return bakepack.find(revisit.CACHE_DIR, bakepack.facts_key(kind, extra, cid[0]), expect)
 
 
 def _facts_store(feats, kind, extra, data):
