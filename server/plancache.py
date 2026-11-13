@@ -97,6 +97,9 @@ def plans_variant():
     import sofiadtm
     if sofiadtm.from_env() is not None:     # (a fine terrain model: its tunnels' rules, roads.FINE_TUNNEL_RULES)
         sofia += f".ft{roads.FINE_TUNNEL_RULES}"
+    import overrides
+    for _name, digest in overrides.key():       # (the overrides file's corrections: overrides.py)
+        sofia += ".ov" + digest
     return sofia or None
 
 

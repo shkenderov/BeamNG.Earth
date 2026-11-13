@@ -507,7 +507,7 @@ def _facts_key(feats, kind, extra):
         return None
     # (by FACTS_FORMAT, not the code: kept across updates, the user, 2026-11-02; cid carries the map data's versions)
     # (Sofia's surveyed streets, while on: every kind's, the ranges and the structures are made from the widths)
-    sofia = _sofia_key()
+    sofia = _sofia_key() + _ov_key()
     return revisit.format_key("cellfacts", FACTS_FORMAT, kind, cid, (extra, sofia) if sofia else extra)
 
 
@@ -1255,7 +1255,10 @@ def _tag_ranges_all(feats):
         np.ascontiguousarray(feats.coord_off, np.int64), np.ascontiguousarray(feats.ring_off, np.int64),
         np.ascontiguousarray(feats.part_off, np.int64), PASSAGE_M)
     rl, kl, ol = rng.tolist(), kinds.tolist(), off.tolist()
-    return [[(rl[r][0], rl[r][1], _KIND_NAMES[kl[r]]) for r in range(ol[i], ol[i + 1])] for i in range(len(feats))]
+    got = [[(rl[r][0], rl[r][1], _KIND_NAMES[kl[r]]) for r in range(ol[i], ol[i + 1])] for i in range(len(feats))]
+    import overrides
+    ov = overrides.from_env()
+    return got if ov is None else ov.levels(feats, got)      # (the overrides file's "level": overrides.py)
 
 
 PASSAGE_M = 40.0        # m: a tunnel range this short between two bridge ranges is a passage through a tower
@@ -1853,8 +1856,13 @@ def _lane_overrides(feats):
     """{feature: lanes} of rampoverrides (PR #471), once per Features."""
     d = feats.__dict__.get("_lane_overrides")
     if d is None:
+        import overrides
         import rampoverrides
-        d = feats.__dict__["_lane_overrides"] = rampoverrides.lane_counts(feats)
+        d = rampoverrides.lane_counts(feats)
+        ov = overrides.from_env()
+        if ov is not None:              # (the overrides file wins: overrides.py)
+            d = {**d, **ov.lane_counts(feats)}
+        d = feats.__dict__["_lane_overrides"] = d
     return d
 
 
@@ -2107,7 +2115,7 @@ def _road_specs_kept(feats, urban_fn=None, widths=None, left_hand=False):
         keep = True             # (specs made while a download failed are not remembered: asked again, PR #634)
         extra = (widths is not None, bool(left_hand)) + ((franceroads.VERSION,) if franceroads.ON else ()) + (
             (photosurface.TAG,) if photosurface.ON else ()) + ((europewalks.VERSION,) if europewalks.enabled() else ()) \
-            + _sofia_key()
+            + _sofia_key() + _ov_key()
         cid = feats.__dict__.get("_bnge_cell")
         # (the land cover's too, by this process's urban_fn: its own Surface, the same all along; a city layer's
         # specs with its parking widths were ~0.37 s of each of its road tiles after every reload, 2026-11-02)
@@ -2172,7 +2180,14 @@ def _street_spec_key(urban_fn, widths, left_hand):
         k += (franceroads.VERSION,)
     if europewalks.enabled():
         k += (europewalks.VERSION,)
-    return k + _sofia_key()
+    return k + _sofia_key() + _ov_key()
+
+
+def _ov_key():
+    """The spec / facts keys' part for the overrides file (overrides.py, BNE_OVERRIDES): (("ov", content hash),) while
+    it holds corrections, () without (the keys as they were)."""
+    import overrides
+    return overrides.key()
 
 
 def _sofia_key():
@@ -3069,6 +3084,11 @@ def _unbuilt_all(feats):
     construction share summed over its flag rows in their order, as one at a time did."""
     n = len(feats)
     out = np.zeros(n, bool)
+    import overrides
+    ov = overrides.from_env()
+    if ov is not None:              # (the overrides file's "skip": overrides.py)
+        for i in ov.skipped(feats):
+            out[i] = True
     col = feats.attrs.get("osm_highway")
     if col is not None:
         out |= np.isin(np.asarray([str(v) for v in col.tolist()] if hasattr(col, "tolist") else
@@ -3236,6 +3256,29 @@ def _road_specs(feats, urban_fn, left_hand, towns=None):
             out[i] = europewalks.plan(spec, country, lon, lat, str(names[i]) if names is not None else "",
                                       str(tags[i]) if tags is not None else "", width,
                                       frontage.get(i, (0., 0.)), urban_fn is not None)
+    return _override_specs(feats, out)
+
+
+def _override_specs(feats, specs):
+    """specs with the overrides file's carriageway width and sidewalk sides (overrides.py): after every other rule,
+    the surveyed widths and OpenStreetMap's sidewalk tag included. Pure given the file."""
+    import overrides
+    ov = overrides.from_env()
+    if ov is None or not len(feats):
+        return specs
+    widths, sides = ov.widths(feats), ov.sidewalks(feats)
+    if not widths and not sides:
+        return specs
+    out = list(specs)
+    for i in set(widths) | set(sides):
+        sp = out[i]
+        if sp is None:
+            continue
+        if i in widths:
+            sp = sp._replace(width=float(widths[i]))
+        if i in sides:
+            sp = sp._replace(sides=sides[i])
+        out[i] = sp
     return out
 
 
@@ -3968,6 +4011,13 @@ def _bridge_specs(feats, want="bridge"):
     for i, yes in enumerate(surveyed):
         if yes:
             free[i] = True
+    import overrides
+    ov = overrides.from_env()
+    if ov is not None:              # (the overrides file's width: the deck's own, after the surveyed ones)
+        for i, w in ov.widths(feats).items():
+            if out[i] is not None:
+                out[i] = out[i]._replace(width=float(w))
+                free[i] = True
     for i, sp in enumerate(out):
         g = ground[i] if ground is not None and sp is not None else None
         if g is not None and g.median:
