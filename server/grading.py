@@ -5181,6 +5181,11 @@ class _Planner:
         if race is not None:                # (the terrain is a racetrack's surface: GitHub #143, smoothed: #833)
             out[race] = self._raceway_ground(e[race], n[race], base.ravel()[race])
         keep = self._over_tunnels(e, n)
+        if keep is not None and roadsmod.fine_model_on():
+            # (a tunnel's open section lies in its own cut: the ground under its carriageway is graded to its floor
+            # even where another covered tunnel's keep zone reaches it, e.g. a service ramp beside an underpass; the
+            # drawn road there stood 2-5 m over the tube it leaves: the road mesh drapes on this ground)
+            keep &= ~self._on_open_sections(e, n)
         if keep is not None:
             # (a small change stays: a road over the tunnel lies on its own graded profile, the ground over the tunnel
             # left ungraded under it stood a few cm over the E6's lanes as patches of bare ground, GitHub #2)
@@ -5254,6 +5259,23 @@ class _Planner:
         for xy, hw in zones:
             fast._ef.over_tunnel(mask, ee, nn, np.ascontiguousarray(xy[:, :2], np.float64), float(hw), 0.0)
         return mask if mask.any() else None
+
+    def _on_open_sections(self, e, n):
+        """Which points (e, n) lie on the carriageway of a tunnel's open section (opens: half the road's width): a
+        point at its ends or at a vertex too (a clamped projection, unlike over_tunnel's: the vertices are where
+        the road's height is read)."""
+        with self.lock:
+            zones = [(np.asarray(xy, np.float64)[:, :2], spec.width / 2) for v in self.opens.values() for xy, spec in v]
+        zones = [z for z in zones if len(z[0]) >= 2]
+        if not zones or not len(e):
+            return np.zeros(len(e), bool)
+        import fast
+        fast.require(0, "points_near_segments")
+        pts = np.ascontiguousarray(np.c_[e, n], np.float64)
+        a = np.ascontiguousarray(np.concatenate([xy[:-1] for xy, _hw in zones]))
+        b = np.ascontiguousarray(np.concatenate([xy[1:] for xy, _hw in zones]))
+        hw = np.concatenate([np.full(len(xy) - 1, h) for xy, h in zones])
+        return np.asarray(fast._ef.points_near_segments(pts, a, b, hw), bool)
 
     def _over_tunnels(self, e, n):
         """Which points lie over a covered tunnel (its half width + TUNNEL_KEEP_M), or None."""
