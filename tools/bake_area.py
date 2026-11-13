@@ -8,11 +8,14 @@ so the plans carry the server's signature. It plans every map cell of the box (g
 points) and makes its roads' facts (level ranges, specs). Only what the pipeline itself keeps as complete goes in the
 pack: the plans PlanCache.store persists, the facts roads._facts_store keeps (lidar rule cells are made again with
 the lidar, BNE_LIDAR_GAPS_WAIT raised). --cache: a cache folder of its own (the map data and DEM downloaded there).
+A bake makes its plans and facts itself, from a cold cache or a warm one: those an earlier bake left in the folder are
+dropped first (forget_made), and a pack in it is not read, so only what this bake made is recorded: the pack is the same.
 """
 import argparse
 import json
 import multiprocessing
 import os
+import shutil
 import sys
 import time
 
@@ -20,6 +23,50 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PASSES = 3                  # planning passes: cells short of something in one are planned again in the next
 SERVER = os.path.join(os.path.dirname(HERE), "server")
 sys.path.insert(0, SERVER)
+
+
+def record(plancache, roads, rec):
+    """Hook plancache.PlanCache and roads to write rec a line for each complete plans / facts the worker makes."""
+    orig_store = plancache.PlanCache.store
+    orig_facts = roads._facts_store
+    seen = set()            # (what this worker recorded: a cell's plans or facts are read again and again)
+
+    def store(self, key, plans, keeps, covers, opens, persist=False):
+        ok = orig_store(self, key, plans, keeps, covers, opens, persist)
+        if ok and persist:
+            if ("plans", self.signature, tuple(int(k) for k in key)) not in seen:
+                seen.add(("plans", self.signature, tuple(int(k) for k in key)))
+                rec.write(json.dumps({"plans": [int(k) for k in key], "sig": self.signature,
+                                      "path": self._path(key)}) + "\n")
+                rec.flush()
+        return ok
+
+    def note_facts(feats, kind, extra, data):
+        cid = feats.__dict__.get("_bnge_cell")
+        k = ("facts", kind, json.dumps(extra, sort_keys=True), cid[0] if cid is not None else None)
+        if cid is not None and k not in seen:
+            seen.add(k)
+            rec.write(json.dumps({"facts": kind, "extra": extra, "cell": cid[0], "versions": cid[2],
+                                  "data": data}) + "\n")
+            rec.flush()
+
+    def facts(feats, kind, extra, data):
+        orig_facts(feats, kind, extra, data)
+        note_facts(feats, kind, extra, data)
+
+    plancache.PlanCache.store = store
+    roads._facts_store = facts
+    # (a pack in the cache folder is not read either: its plans and facts would not be made, so not recorded)
+    plancache.PlanCache._baked = lambda self, key: None
+    roads._facts_baked = lambda feats, kind, extra: None
+
+
+def forget_made(cache):
+    """Drop the plans and facts an earlier bake left in the cache folder (the map data and the elevation stay): read
+    back, they would not be made again, and the pack would miss what making them asks for (the neighbour cells'
+    facts) and what the cold one holds."""
+    for kind in ("plans", "cellfacts"):
+        shutil.rmtree(os.path.join(cache, "revisit", kind), ignore_errors=True)
 
 
 def _worker(args):
@@ -34,26 +81,7 @@ def _worker(args):
     earthd.raise_open_files()
     bw.init(cache, False, True, True, True, True, None, logging.WARNING, True, True, 0, None, False)
     rec = open(out_jsonl, "a")
-    orig_store = plancache.PlanCache.store
-    orig_facts = roads._facts_store
-
-    def store(self, key, plans, keeps, covers, opens, persist=False):
-        ok = orig_store(self, key, plans, keeps, covers, opens, persist)
-        if ok and persist:
-            rec.write(json.dumps({"plans": [int(k) for k in key], "sig": self.signature,
-                                  "path": self._path(key)}) + "\n")
-            rec.flush()
-        return ok
-
-    def facts(feats, kind, extra, data):
-        orig_facts(feats, kind, extra, data)
-        cid = feats.__dict__.get("_bnge_cell")
-        if cid is not None:
-            rec.write(json.dumps({"facts": kind, "extra": extra, "cell": cid[0], "versions": cid[2],
-                                  "data": data}) + "\n")
-            rec.flush()
-    plancache.PlanCache.store = store
-    roads._facts_store = facts
+    record(plancache, roads, rec)
     lat0, lon0 = cells[0][3], cells[0][4]
     g, _ = bw._s.anchor(1, lat0, lon0)
     md = bw._s.md
@@ -106,6 +134,7 @@ def main():
     cells = [(k.z, k.x, k.y, *k.center()) for k in keys]
     print(f"{len(cells)} cells, {a.procs} processes", flush=True)
     os.makedirs(a.cache, exist_ok=True)
+    forget_made(a.cache)
     plancache.start_run(a.cache)            # (one run: the workers share plans, lock files)
     os.environ.setdefault("BNE_LIDAR_GAPS_WAIT", "120")
     work = os.path.join(a.cache, "bake_work")
@@ -155,12 +184,13 @@ def main():
                 except OSError:
                     continue
                 sigs.add(r["sig"])
-                wr.add(bakepack.plans_key(r["sig"], r["plans"]), data)
-                n_plans += 1
+                k = bakepack.plans_key(r["sig"], r["plans"])
+                n_plans += k not in wr.items        # (several workers read the same cell's plans)
+                wr.add(k, data)
             elif "facts" in r:
-                wr.add(bakepack.facts_key(r["facts"], r["extra"], r["cell"]),
-                       json.dumps(r["data"]).encode("utf-8"))
-                n_facts += 1
+                k = bakepack.facts_key(r["facts"], r["extra"], r["cell"])
+                n_facts += k not in wr.items
+                wr.add(k, json.dumps(r["data"]).encode("utf-8"))
     if len(sigs) > 1:
         raise SystemExit(f"several plan signatures: {sigs}")
     meta = {"bake_format": bakepack.BAKE_FORMAT, "plans_format": plancache.PLANS_FORMAT,
