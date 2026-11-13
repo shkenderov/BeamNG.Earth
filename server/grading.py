@@ -5846,6 +5846,25 @@ def bridge_chain_ends_free(line, all_bridges, xy):
     return True
 
 
+# A bridge part shorter than STUB_M whose other end is a joint of STUB_JOINTS or more other bridge parts is a side road's stub
+# (the map data or the span rules, roads._skew_decks, carry a junction's deck a few metres onto the street joined at it): the
+# street meets the deck at the junction, at grade there, and is not an abutment of the chain. Lifting its free end for the
+# roads under the chain's other parts raised the street 8.4 m over its own ground within 5 m of that junction while the deck
+# there stands at the junction's height (Botevgradsko shosse and Madrid, Sofia: a 5 m stub's ramp 8.3 m over the deck it
+# joins, a portal step 8.3 m; Gotse Delchev: 7.4 m).
+STUB_ON = os.environ.get("BNE_STUB_LIFT", "on") != "off"
+STUB_M = APPROACH_MIN_CROSS_M
+STUB_JOINTS = 2
+
+
+def _ends_at(other, line, end):
+    """Whether bridge part `other` (not line itself) has an end within 0.75 m of the point `end`."""
+    o = np.asarray(other, np.float64)
+    if len(o) == len(line) and np.array_equal(o[:, :2], np.asarray(line, np.float64)[:, :2]):
+        return False
+    return min(np.hypot(*(o[0, :2] - end[:2])), np.hypot(*(o[-1, :2] - end[:2]))) < 0.75
+
+
 def bridge_lifts(line, all_bridges, ground_lines, z_at, chain=None, rail_lines=(), under_z=None):
     """[(end xy (2,), lift m)] of a bridge part (line (k, 2) ENU m): at each of its ends that no other bridge part
     continues from (an abutment), how far the ground there must be raised for the deck to clear every road crossing
@@ -5925,9 +5944,11 @@ def bridge_lifts(line, all_bridges, ground_lines, z_at, chain=None, rail_lines=(
     if not len(zu):
         return []
     out = []
-    for (end, at), jn in zip(((line[0], 0.0), (line[-1], s[-1])), joined):
+    for (end, at), jn, other in zip(((line[0], 0.0), (line[-1], s[-1])), joined, (line[-1], line[0])):
         if jn:
             continue
+        if STUB_ON and s[-1] < STUB_M and sum(1 for o in all_bridges if _ends_at(o, line, other)) >= STUB_JOINTS:
+            continue        # (a stub: see STUB_M)
         d = np.r_[np.abs(arcs - at), np.hypot(*(pts[len(arcs):] - end).T)] if more else np.abs(arcs - at)
         far = (d >= APPROACH_MIN_CROSS_M) | rail     # (a road meeting the abutment itself: a junction at grade)
         if not far.any():
