@@ -6,9 +6,10 @@ ground, offline (no game), for a baked pack (server/bakepack.py) and the terrain
         python tools/levelcheck.py dist/sofia.bnge --cache cache/full --out reports/levelcheck
 
 Run it with the env vars the pack was baked with (they are part of its meta: a pack whose "variant" differs from the
-running server's is refused). It writes levelcheck.json (every finding: check, way, lat, lon, value, limit, ...) and
-levelcheck.csv (the same, worst first) into --out and prints a one-line total per check. Two runs over the same pack
-and inputs write byte-identical files (no times in them).
+running server's is refused). It writes levelcheck.json (every finding: check, way, lat, lon, value, limit, class, ...)
+and levelcheck.csv (the same: the defects first, worst first, then the findings set apart as `earthwork` or `terrain`)
+into --out and prints a one-line total per check: the totals count the defects, the others are counted apart. Two
+runs over the same pack and inputs write byte-identical files (no times in them).
 
 What is compared with what (heights are geodetic metres in the terrain model's own datum: the plans, the profiles and
 the terrain all read the one dem.Dem, so no datum offset exists between them; "z" below is that height):
@@ -30,7 +31,19 @@ the terrain all read the one dem.Dem, so no datum offset exists between them; "z
               vertex, at the zoom the plans, the profiles and the terrain blocks use, as the game shapes it before the
               road grading: with the rivers' and lakes' beds carved in (the sea carver) and the runways graded in.
 
-  ground      surface z of a ground part minus terrain, more than GROUND_LIMIT_M either way, per run of vertices.
+  ground      surface z of a ground part minus terrain, more than GROUND_LIMIT_M either way, per run of vertices. A run is
+              an `earthwork` (counted apart, listed after the defects) when a structure explains it, else a `defect`:
+                above the terrain: the road climbs to a bridge's end; below it: the road falls to a tunnel's mouth (or the
+              open section of one) or dips under a bridge deck crossing it; and in each case the road, followed from the
+              structure along the road network, meets its end z within GROUND_LIMIT_M, and the offset from the terrain
+              never grows by more than TAPER_TOL_M while it falls to GROUND_LIMIT_M within the reach the generator builds
+              such ramps (BRIDGE_RAMP_REACH_M, TUNNEL_RAMP_REACH_M, UNDER_RAMP_REACH_M). Every vertex of the run
+              must be so explained: a run that is only near a structure, or that stops short of the ground, is a defect.
+              Every ground finding also names the nearest bridge, tunnel or tunnel open section: near_kind, near_id,
+              near_way, near_m, near_basis ("network": metres along the roads to its end or to where its deck crosses
+              the road, within NET_REACH_M; "straight": metres in a straight line to its line where no such way leads
+              to one), near_role, and near_straight_m, the straight-line distance to the nearest of them; run_m is the
+              length of the run along the road (0 for one vertex).
   cover       a tunnel: terrain - (floor + vault height) under COVER_MIN_M, or the floor above the terrain; the first
               PORTAL_ZONE_M from a portal are not judged (the portal face rises to the ground there).
   clearance   a bridge deck over a road: (deck z - structure depth) - road surface z at the crossing of their
@@ -38,11 +51,17 @@ the terrain all read the one dem.Dem, so no datum offset exists between them; "z
               JUNCTION_END_M of an end of either, the two surfaces less than JUNCTION_DZ_M apart) are skipped.
   portal      a bridge or tunnel end and the surface part (or another structure) it meets within APPROACH_M: the
               height step over PORTAL_STEP_M.
-  grade       the steepest rise over GRADE_WINDOW_M along a paved part's own surface, over GRADE_MAX.
+  grade       the steepest rise over GRADE_WINDOW_M along a paved part's own surface, over GRADE_MAX. A run is `terrain`
+              (counted apart) where the road is no steeper than the ground it runs on: the terrain along the same centre
+              line, smoothed over TERRAIN_SMOOTH_M, is read over the same windows, and the road's largest excess over it,
+              taken over the run's windows past GRADE_MAX, is at most GRADE_TERRAIN_MARGIN and the steepest window at
+              most GRADE_CEILING (a paved road steeper than that is a defect whatever the ground does). A bridge or tunnel
+              part, or a part with no terrain, is a defect: the ground under a deck says nothing of its grade.
   seam        two parts of one way of the same kind meeting (ends within JOIN_M): the height step over SEAM_STEP_M.
 """
 import argparse
 import csv
+import heapq
 import json
 import math
 import os
@@ -61,6 +80,23 @@ PORTAL_STEP_M = 0.2         # a bridge / tunnel end against its approach
 GRADE_MAX = 0.12            # paved road: rise over run
 GRADE_WINDOW_M = 10.0       # ... over this run
 SEAM_STEP_M = 0.1           # consecutive parts of one way
+
+# ---- how findings are classed (measured on the Sofia full area; see the report that came with them) --------------------
+# A ground finding is an `earthwork` when a structure explains it (see the docstring). The reaches are the generator's:
+BRIDGE_RAMP_REACH_M = 400.0     # a road climbing to a bridge's end: grading.RAMP_REACH_M (the envelope goes at most this far
+                                # along the roads from a raised one; grading.APPROACH_MAX_RUN, the longest ramp, is 320)
+TUNNEL_RAMP_REACH_M = 130.0     # a road falling to a tunnel's mouth: roads.FINE_APPROACH_MAX_M / roads.TUNNEL_GRADE (6.5 m at
+                                # 5 %; the street tunnels' own ramps fall at roads.FINE_RAMP_GRADE, 10 %, so 65 m)
+UNDER_RAMP_REACH_M = 221.0      # a road dipping under a deck: grading.UNDER_FLAT_M + UNDER_MAX_DROP_M * pi / (2 * UNDER_GRADE) (12 + 8 * pi / .12)
+TAPER_TOL_M = 1.5               # the offset may rise this much going away from the structure (terrain relief: of the 458 runs
+                                # a 5 m tolerance would explain, 433 need 1.0 m or less, 440 need 1.5 m, the rest 2 to 5 m)
+NODE_M = 2.5                    # part ends this close are one node of the road network (= APPROACH_M)
+NET_REACH_M = 400.0             # nearest structure along the roads: looked for this far
+
+# A grade finding is `terrain` when the road is no steeper than the ground it runs on (see the docstring):
+TERRAIN_SMOOTH_M = 5.0          # terrain smoothed over this (box) along the centre line: measured, see below
+GRADE_TERRAIN_MARGIN = 0.07     # road steeper than the terrain by more than this in any window of the run past GRADE_MAX ...
+GRADE_CEILING = 0.25            # ... or over this anywhere: a defect (grade finding, any ground)
 
 # ---- how the parts are read (not limits) -----------------------------------------------------------------------------
 PORTAL_ZONE_M = 12.0        # m from a portal not judged for cover (roads.PORTAL_LOOK_M: where the face reads the ground)
@@ -115,8 +151,8 @@ class Piece:
         return self.way or self.fid
 
 
-def _finding(check, p, i, value, note="", at=None):
-    """A finding of check on piece p at vertex i (or at = (lat, lon))."""
+def _finding(check, p, i, value, note="", at=None, **extra):
+    """A finding of check on piece p at vertex i (or at = (lat, lon)); extra: more fields (class, context)."""
     la, lo = (float(p.lat[i]), float(p.lon[i])) if at is None else at
     lim = LIMITS[check]
     v = float(value)
@@ -126,9 +162,11 @@ def _finding(check, p, i, value, note="", at=None):
         sev = 1.0 + (lim - v) / lim
     else:
         sev = abs(v) / lim
-    return {"check": check, "way": p.way, "fid": p.fid, "kind": p.kind, "cls": p.cls, "name": p.name,
-            "lat": round(la, 6), "lon": round(lo, 6), "value": round(v, 3), "limit": lim,
-            "severity": round(sev, 3), "note": note}
+    out = {"check": check, "way": p.way, "fid": p.fid, "kind": p.kind, "cls": p.cls, "name": p.name,
+           "lat": round(la, 6), "lon": round(lo, 6), "value": round(v, 3), "limit": lim,
+           "severity": round(sev, 3), "note": note, "class": "defect"}
+    out.update(extra)
+    return out
 
 
 def _runs(bad, arc):
@@ -149,7 +187,9 @@ def _runs(bad, arc):
 
 # ---- the per-part checks ---------------------------------------------------------------------------------------------
 
-def check_ground(p):
+def check_ground(p, ctx=None):
+    """The ground findings of a part. With ctx (a Context of all the parts) each says what structure is nearest and is
+    classed `earthwork` where one explains it; without, every finding is a `defect` with no context."""
     if p.kind != "ground" or p.terrain is None:
         return []
     d = p.z - p.terrain
@@ -157,7 +197,9 @@ def check_ground(p):
     for a, b in _runs(np.isfinite(d) & (np.abs(d) > GROUND_LIMIT_M), p.arc):
         seg = d[a:b + 1]
         i = a + int(np.nanargmax(np.abs(seg)))
-        out.append(_finding("ground", p, i, d[i], "above terrain" if d[i] > 0 else "below terrain"))
+        extra = ctx.ground_context(p, a, b, i) if ctx is not None else {}
+        extra["run_m"] = round(float(p.arc[b] - p.arc[a]), 1)
+        out.append(_finding("ground", p, i, d[i], "above terrain" if d[i] > 0 else "below terrain", **extra))
     return out
 
 
@@ -183,6 +225,17 @@ def _resample(p, step=1.0):
     return s, np.interp(s, p.arc, p.z)
 
 
+def _smooth(z, width_m, step=1.0):
+    """z (every step m) averaged over width_m (a box; the ends reflected about their end points, so a slope keeps its
+    grade to the end)."""
+    h = int(round(width_m / step)) // 2
+    if h < 1 or len(z) < 2:
+        return z
+    zp = np.pad(z, h, mode="reflect", reflect_type="odd")
+    c = np.r_[0.0, np.cumsum(zp)]
+    return (c[2 * h + 1:] - c[:-(2 * h + 1)]) / (2 * h + 1)
+
+
 def check_grade(p):
     if not p.paved or p.length < GRADE_MIN_LEN_M or len(p.xy) < 2:
         return []
@@ -193,6 +246,12 @@ def check_grade(p):
         s, z, k = np.array([0.0, p.length]), np.interp([0.0, p.length], p.arc, p.z), 1
         w = p.length
     g = np.abs(z[k:] - z[:-k]) / (s[k:] - s[:-k])
+    # the terrain's grade over the same windows, on the terrain smoothed along the centre line: only where there is a
+    # ground to follow (a deck or a tube says nothing of it)
+    gt = None
+    if p.kind in SURFACE and p.terrain is not None and np.all(np.isfinite(p.terrain)):
+        t = _smooth(np.interp(s, p.arc, p.terrain), TERRAIN_SMOOTH_M)
+        gt = np.abs(t[k:] - t[:-k]) / (s[k:] - s[:-k])
     out = []
     # (a window is placed at its middle vertex of the 1 m grid; runs along it)
     mid = (s[:-k] + s[k:]) / 2
@@ -202,7 +261,14 @@ def check_grade(p):
         j = int(np.argmin(np.abs(p.arc - at)))
         la = float(np.interp(at, p.arc, p.lat))
         lo = float(np.interp(at, p.arc, p.lon))
-        out.append(_finding("grade", p, j, g[i], f"over {w:.0f} m", at=(la, lo)))
+        extra = {}
+        if gt is not None:
+            steep = g[a:b + 1] > GRADE_MAX
+            excess = float(np.max((g[a:b + 1] - gt[a:b + 1])[steep]))
+            extra = {"terrain_grade": round(float(gt[i]), 4), "excess": round(excess, 4)}
+            if excess <= GRADE_TERRAIN_MARGIN and float(g[i]) <= GRADE_CEILING:
+                extra["class"] = "terrain"
+        out.append(_finding("grade", p, j, g[i], f"over {w:.0f} m", at=(la, lo), **extra))
     return out
 
 
@@ -294,8 +360,10 @@ def _seg_cross(a0, a1, b0, b1):
     return (t, u) if 0.0 <= t <= 1.0 and 0.0 <= u <= 1.0 else None
 
 
-def check_clearance(pieces):
-    """Every bridge deck over a road (a surface part, or a lower deck): clearance under its structure at the crossing."""
+def deck_crossings(pieces):
+    """Every crossing of a bridge deck over a road (a surface part, or a lower deck) that is no junction, in the order
+    check_clearance judges them: (pa, ka, pb, kb, t, u, za, zb, sa, sb), the deck A's segment ka at t, the road B's
+    segment kb at u, their heights there and the arcs along each."""
     cell = 40.0
     segs = []                       # (piece, segment index)
     for pi, p in enumerate(pieces):
@@ -305,7 +373,6 @@ def check_clearance(pieces):
             segs.append((pi, k))
     mids = [(pieces[pi].xy[k] + pieces[pi].xy[k + 1]) / 2 for pi, k in segs]
     grid = _grid(mids, cell)
-    out, kept = [], {}
     for pa, A in enumerate(pieces):
         if A.kind != "bridge" or len(A.xy) < 2:
             continue
@@ -331,41 +398,286 @@ def check_clearance(pieces):
                 if za - zb < JUNCTION_DZ_M and (min(sa, A.length - sa) < JUNCTION_END_M
                                                 or min(sb, B.length - sb) < JUNCTION_END_M):
                     continue                    # (a road meeting the deck's abutment, a ramp: not an underpass)
-                clear = float(za - A.depth - zb)
-                if clear >= CLEARANCE_MIN_M:
-                    continue
-                at = (float(A.lat[ka] + t * (A.lat[ka + 1] - A.lat[ka])), float(A.lon[ka] + t * (A.lon[ka + 1] - A.lon[ka])))
-                key = (pa, pb)
-                prev = kept.get(key)
-                if prev is not None and abs(prev[0] - sa) < RUN_GAP_M:     # (the same crossing met again on a bend)
-                    if clear < prev[1]["value"]:
-                        out[prev[2]] = _finding("clearance", A, ka, clear, f"over {B.kind} {B.fid[:8]} {B.cls}", at=at)
-                        kept[key] = (sa, out[prev[2]], prev[2])
-                    continue
-                out.append(_finding("clearance", A, ka, clear, f"over {B.kind} {B.fid[:8]} {B.cls}", at=at))
-                kept[key] = (sa, out[-1], len(out) - 1)
+                yield pa, ka, pb, kb, t, u, float(za), float(zb), sa, sb
+
+
+def check_clearance(pieces):
+    """Every bridge deck over a road (a surface part, or a lower deck): clearance under its structure at the crossing."""
+    out, kept = [], {}
+    for pa, ka, pb, kb, t, u, za, zb, sa, sb in deck_crossings(pieces):
+        A, B = pieces[pa], pieces[pb]
+        clear = float(za - A.depth - zb)
+        if clear >= CLEARANCE_MIN_M:
+            continue
+        at = (float(A.lat[ka] + t * (A.lat[ka + 1] - A.lat[ka])), float(A.lon[ka] + t * (A.lon[ka + 1] - A.lon[ka])))
+        key = (pa, pb)
+        prev = kept.get(key)
+        if prev is not None and abs(prev[0] - sa) < RUN_GAP_M:     # (the same crossing met again on a bend)
+            if clear < prev[1]["value"]:
+                out[prev[2]] = _finding("clearance", A, ka, clear, f"over {B.kind} {B.fid[:8]} {B.cls}", at=at)
+                kept[key] = (sa, out[prev[2]], prev[2])
+            continue
+        out.append(_finding("clearance", A, ka, clear, f"over {B.kind} {B.fid[:8]} {B.cls}", at=at))
+        kept[key] = (sa, out[-1], len(out) - 1)
     return out
+
+
+class Context:
+    """The parts as a road network, for what a single part cannot say: which structure is nearest a ground finding, and
+    whether one explains it (an earthwork). Nodes: part ends within NODE_M are one node; ground parts are the roads
+    between them; bridge, tunnel and open parts are structures standing at nodes (or, a deck, over a road)."""
+
+    def __init__(self, pieces):
+        self.pieces = pieces
+        self.index = {id(p): i for i, p in enumerate(pieces)}
+        self.node_of = {}                           # (piece, end) -> node
+        self.ground_at = {}                         # node -> [(ground piece, end)]
+        self.struct_at = {}                         # node -> [(structure piece, end)]
+        self._nodes()
+        self.over = {}                              # ground piece -> [(arc of a deck's crossing, deck piece, segment)]
+        for pa, ka, pb, kb, t, u, za, zb, sa, sb in deck_crossings(pieces):
+            if pieces[pb].kind == "ground":
+                self.over.setdefault(pb, []).append((sb, pa, kb))
+        self.explained = {}                         # (ground piece, vertex) -> (origin, taper length m)
+        self._mark_earthworks()
+        self._structure_lines()
+
+    # -- the network
+    def _nodes(self):
+        ends = _ends(self.pieces)
+        cell = max(NODE_M, 1.0)
+        grid = _grid([e[2] for e in ends], cell)
+        root = list(range(len(ends)))
+
+        def find(a):
+            while root[a] != a:
+                root[a] = root[root[a]]
+                a = root[a]
+            return a
+
+        for ai, (_pa, _ea, xa, _za) in enumerate(ends):
+            for bi in _near(grid, cell, xa[0], xa[1], NODE_M):
+                if bi > ai and float(np.hypot(*(xa - ends[bi][2]))) <= NODE_M:
+                    ra, rb = find(ai), find(bi)
+                    if ra != rb:
+                        root[max(ra, rb)] = min(ra, rb)
+        for ai, (pa, ea, _xa, _za) in enumerate(ends):
+            n = find(ai)
+            self.node_of[(pa, ea)] = n
+            at = self.ground_at if self.pieces[pa].kind == "ground" else self.struct_at
+            at.setdefault(n, []).append((pa, ea))
+
+    # -- earthworks: what a structure's ramps explain
+    def _mark_earthworks(self):
+        P = self.pieces
+        sys.setrecursionlimit(max(sys.getrecursionlimit(), 5000))      # (a walk goes part by part, a few metres each)
+        for pi, p in enumerate(P):
+            if p.kind == "ground" or len(p.xy) < 2:
+                continue
+            if p.kind == "bridge":
+                sgn, reach = 1, BRIDGE_RAMP_REACH_M
+            else:
+                sgn, reach = -1, TUNNEL_RAMP_REACH_M
+            for end in (0, 1):
+                if p.kind == "tunnel" and not p.mouth[end]:
+                    continue                        # (a joint inside a tunnel, not a mouth)
+                z_end = p.z[0] if end == 0 else p.z[-1]
+                for pj, ej in self.ground_at.get(self.node_of[(pi, end)], ()):
+                    q = P[pj]
+                    if q.terrain is None or abs((q.z[0] if ej == 0 else q.z[-1]) - z_end) > GROUND_LIMIT_M:
+                        continue                    # (the road does not rise to the structure: no ramp of it)
+                    ks, ss = self._from_end(q, ej, 0.0)
+                    self._walk((p.kind, p.fid, p.way, "end"), sgn, reach, pj, ks, ss, ej == 0, math.inf, {pj})
+        for pb, lst in sorted(self.over.items()):
+            q = P[pb]
+            if q.terrain is None:
+                continue
+            for sb, pa, kb in lst:
+                A = P[pa]
+                origin = (A.kind, A.fid, A.way, "over")
+                back = np.arange(kb, -1, -1)
+                self._walk(origin, -1, UNDER_RAMP_REACH_M, pb, back, sb - q.arc[back], False, math.inf, {pb})
+                fwd = np.arange(kb + 1, len(q.xy))
+                self._walk(origin, -1, UNDER_RAMP_REACH_M, pb, fwd, q.arc[fwd] - sb, True, math.inf, {pb})
+
+    @staticmethod
+    def _from_end(q, end, s0):
+        """(vertices, distances along the road) of a part walked from its end."""
+        if end == 0:
+            return np.arange(len(q.xy)), s0 + q.arc
+        return np.arange(len(q.xy) - 1, -1, -1), s0 + (q.length - q.arc[::-1])
+
+    def _walk(self, origin, sgn, reach, pj, ks, ss, fwd, runmin, onpath):
+        """Follow the road along part pj's vertices ks (distances ss from the structure), then on through its far end's
+        node into every road there. sgn * (z - terrain) is the offset the structure explains (bridge: above, tunnel and
+        deck over it: below). The walk holds while the offset does not grow past TAPER_TOL_M and ends (the ground is
+        reached) where it is within GROUND_LIMIT_M; it fails when it grows, changes sign, runs past `reach` or comes to
+        a road's end first. The vertices of a walk that reaches the ground are marked explained. Returns the distance
+        at which the ground was reached on the first branch that did, or None."""
+        q = self.pieces[pj]
+        d = q.z - q.terrain
+        for n, k in enumerate(ks):
+            dk = float(d[k])
+            if not math.isfinite(dk):
+                return None
+            if abs(dk) <= GROUND_LIMIT_M:
+                self._mark(pj, ks[:n + 1], origin, float(ss[n]))
+                return float(ss[n])
+            x = sgn * dk
+            if x < 0.0 or x > runmin + TAPER_TOL_M or ss[n] > reach:
+                return None
+            runmin = min(runmin, x)
+        if not len(ks):
+            return None
+        hit = None
+        for pk, ek in self.ground_at.get(self.node_of[(pj, 1 if fwd else 0)], ()):
+            r = self.pieces[pk]
+            if pk in onpath or r.terrain is None:
+                continue
+            ks2, ss2 = self._from_end(r, ek, float(ss[-1]))
+            onpath.add(pk)
+            res = self._walk(origin, sgn, reach, pk, ks2, ss2, ek == 0, runmin, onpath)
+            onpath.discard(pk)
+            if res is not None and hit is None:
+                hit = res
+        if hit is not None:
+            self._mark(pj, ks, origin, hit)
+        return hit
+
+    def _mark(self, pj, ks, origin, taper):
+        for k in ks:
+            self.explained.setdefault((pj, int(k)), (origin, taper))
+
+    # -- the nearest structure
+    def _structure_lines(self):
+        a, b, who = [], [], []
+        for pi, p in enumerate(self.pieces):
+            if p.kind != "ground" and len(p.xy) >= 2:
+                a.append(p.xy[:-1])
+                b.append(p.xy[1:])
+                who += [pi] * (len(p.xy) - 1)
+        self.line_a = np.concatenate(a) if a else np.zeros((0, 2))
+        self.line_b = np.concatenate(b) if b else np.zeros((0, 2))
+        self.line_of = np.array(who, np.int64)
+
+    def straight(self, xy):
+        """(distance m, structure piece) of the nearest structure line to xy, or (None, None)."""
+        if not len(self.line_of):
+            return None, None
+        ab = self.line_b - self.line_a
+        den = np.maximum((ab * ab).sum(axis=1), 1e-12)
+        t = np.clip(((xy - self.line_a) * ab).sum(axis=1) / den, 0.0, 1.0)
+        d = np.hypot(*(self.line_a + t[:, None] * ab - xy).T)
+        j = int(np.argmin(d))
+        return float(d[j]), int(self.line_of[j])
+
+    def nearest(self, pi, k):
+        """(distance m, structure piece, role) of the nearest structure along the roads from vertex k of ground part pi:
+        to a structure's end at a node ("end") or to where a deck crosses over a road ("over"), within NET_REACH_M; or
+        None."""
+        P = self.pieces
+        p = P[pi]
+        best = None
+
+        def offer(dist, si, role):
+            nonlocal best
+            key = (round(dist, 6), P[si].kind, P[si].fid, role)
+            if best is None or key < best[0]:
+                best = (key, dist, si, role)
+
+        for sb, pa, _kb in self.over.get(pi, ()):
+            offer(abs(sb - float(p.arc[k])), pa, "over")
+        heap, seen = [], {}
+        for end, dist in ((0, float(p.arc[k])), (1, float(p.length - p.arc[k]))):
+            n = self.node_of.get((pi, end))
+            if n is not None:
+                heapq.heappush(heap, (dist, n))
+        while heap:
+            dist, n = heapq.heappop(heap)
+            if n in seen or dist > NET_REACH_M or (best is not None and dist > best[1]):
+                continue
+            seen[n] = dist
+            for si, _se in self.struct_at.get(n, ()):
+                offer(dist, si, "end")
+            for pj, ej in self.ground_at.get(n, ()):
+                r = P[pj]
+                for sb, pa, _kb in self.over.get(pj, ()):
+                    offer(dist + (sb if ej == 0 else r.length - sb), pa, "over")
+                far = self.node_of.get((pj, 1 - ej))
+                if far is not None and far not in seen:
+                    heapq.heappush(heap, (dist + r.length, far))
+        return None if best is None else best[1:]
+
+    def ground_context(self, p, a, b, i):
+        """The fields a ground finding (run a..b of part p, worst vertex i) carries: its class and the nearest structure."""
+        pi = self.index[id(p)]
+        d = p.z - p.terrain
+        bad = [k for k in range(a, b + 1) if np.isfinite(d[k]) and abs(d[k]) > GROUND_LIMIT_M]
+        why = [self.explained.get((pi, k)) for k in bad]
+        out = {"class": "defect", "earth_by": None, "taper_m": None, "near_kind": None, "near_id": None,
+               "near_way": None, "near_m": None, "near_basis": None, "near_role": None, "near_straight_m": None}
+        if bad and all(w is not None for w in why):
+            (kind, fid, _way, role), taper = self.explained.get((pi, i)) or why[0]
+            out.update({"class": "earthwork", "earth_by": f"{kind} {fid[:8]} {role}", "taper_m": round(taper, 1)})
+        ds, sj = self.straight(p.xy[i])
+        if ds is not None:
+            out["near_straight_m"] = round(ds, 1)
+        net = self.nearest(pi, i)
+        if net is not None:
+            dist, si, role = net
+            basis = "network"
+        elif ds is not None:
+            dist, si, role, basis = ds, sj, "line", "straight"
+        else:
+            return out
+        S = self.pieces[si]
+        out.update({"near_kind": S.kind, "near_id": S.fid, "near_way": S.way, "near_m": round(dist, 1),
+                    "near_basis": basis, "near_role": role})
+        return out
 
 
 def run_checks(pieces):
-    """Every finding (a list of dicts), worst first."""
+    """Every finding (a list of dicts): the defects first, worst first, then the findings set apart (earthworks, grades
+    that follow the terrain), worst first."""
     out = []
+    ctx = Context(pieces)
     for p in pieces:
-        out += check_ground(p) + check_cover(p) + check_grade(p)
+        out += check_ground(p, ctx) + check_cover(p) + check_grade(p)
     out += check_joints(pieces) + check_clearance(pieces)
-    out.sort(key=lambda f: (-f["severity"], f["check"], f["way"], f["fid"], f["lat"], f["lon"], f["value"]))
+    out.sort(key=lambda f: (f["class"] != "defect", -f["severity"], f["check"], f["way"], f["fid"], f["lat"], f["lon"],
+                            f["value"]))
     return out
 
 
+SET_APART = {"ground": "earthwork", "grade": "terrain"}      # the class each check sets apart
+
+
 def totals(findings):
+    """{check: number of defects}: the findings set apart are counted by set_apart."""
     t = {c: 0 for c in CHECKS}
     for f in findings:
-        t[f["check"]] += 1
+        if f["class"] == "defect":
+            t[f["check"]] += 1
     return t
 
 
-def total_line(t):
-    return "levelcheck: " + ", ".join(f"{c} {t[c]}" for c in CHECKS) + f" (total {sum(t.values())})"
+def set_apart(findings):
+    """{check: number of findings of the class that check sets apart}."""
+    t = {c: 0 for c in SET_APART}
+    for f in findings:
+        if f["class"] != "defect":
+            t[f["check"]] += 1
+    return t
+
+
+def total_line(t, apart=None):
+    apart = apart or {}
+    parts = []
+    for c in CHECKS:
+        extra = f" (+{apart[c]} {SET_APART[c]})" if apart.get(c) else ""
+        parts.append(f"{c} {t[c]}{extra}")
+    tail = f"total {sum(t.values())} defects" + (f", {sum(apart.values())} set apart" if sum(apart.values()) else "")
+    return "levelcheck: " + ", ".join(parts) + f" ({tail})"
 
 
 # ---- reading a pack ---------------------------------------------------------------------------------------------------
@@ -506,23 +818,32 @@ def inside(f, bbox):
     return S <= f["lat"] <= N and W <= f["lon"] <= E
 
 
-FIELDS = ("check", "way", "fid", "kind", "cls", "name", "lat", "lon", "value", "limit", "severity", "note")
+VERSION = 2                 # the report's layout: 2 = classes (defect / earthwork / terrain), context of ground findings
+FIELDS = ("check", "class", "way", "fid", "kind", "cls", "name", "lat", "lon", "value", "limit", "severity", "note",
+          "earth_by", "taper_m", "near_kind", "near_id", "near_way", "near_m", "near_basis", "near_role",
+          "near_straight_m", "run_m", "terrain_grade", "excess")
 
 
 def write_report(out_dir, findings, info):
     os.makedirs(out_dir, exist_ok=True)
     t = totals(findings)
-    doc = {"version": 1, "thresholds": {**{f"{c}_limit": LIMITS[c] for c in CHECKS}, "grade_window_m": GRADE_WINDOW_M,
-                                       "portal_zone_m": PORTAL_ZONE_M, "approach_m": APPROACH_M, "join_m": JOIN_M},
-           "area": info, "totals": t, "findings": findings}
+    apart = set_apart(findings)
+    thresholds = {**{f"{c}_limit": LIMITS[c] for c in CHECKS}, "grade_window_m": GRADE_WINDOW_M,
+                  "portal_zone_m": PORTAL_ZONE_M, "approach_m": APPROACH_M, "join_m": JOIN_M,
+                  "bridge_ramp_reach_m": BRIDGE_RAMP_REACH_M, "tunnel_ramp_reach_m": TUNNEL_RAMP_REACH_M,
+                  "under_ramp_reach_m": UNDER_RAMP_REACH_M, "taper_tol_m": TAPER_TOL_M, "node_m": NODE_M,
+                  "net_reach_m": NET_REACH_M, "terrain_smooth_m": TERRAIN_SMOOTH_M,
+                  "grade_terrain_margin": GRADE_TERRAIN_MARGIN, "grade_ceiling": GRADE_CEILING}
+    doc = {"version": VERSION, "thresholds": thresholds, "area": info, "totals": t,
+           "set_apart": {f"{c}_{SET_APART[c]}": apart[c] for c in SET_APART}, "findings": findings}
     with open(os.path.join(out_dir, "levelcheck.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(doc, f, indent=1, sort_keys=True, ensure_ascii=False)
         f.write("\n")
     with open(os.path.join(out_dir, "levelcheck.csv"), "w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS, lineterminator="\n")
+        w = csv.DictWriter(f, fieldnames=FIELDS, lineterminator="\n", restval="")
         w.writeheader()
         for r in findings:
-            w.writerow({k: r[k] for k in FIELDS})
+            w.writerow({k: r.get(k) for k in FIELDS})
     return t
 
 
@@ -542,7 +863,7 @@ def main(argv=None):
     box = info["bbox"]
     findings = [f for f in run_checks(pieces) if inside(f, box)]
     t = write_report(a.out, findings, info)
-    print(total_line(t))
+    print(total_line(t, set_apart(findings)))
     if info["plans_made_here"]:
         print(f"warning: {info['plans_made_here']} cells' plans were not in the pack and were planned here")
     print(f"{sum(info['pieces'].values())} parts {info['pieces']}, {len(findings)} findings, "
