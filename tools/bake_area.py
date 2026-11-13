@@ -69,6 +69,28 @@ def forget_made(cache):
         shutil.rmtree(os.path.join(cache, "revisit", kind), ignore_errors=True)
 
 
+def fatal_problems(todo, raised, n_items):
+    """Why the bake must not write a pack: [line], empty when it may. A cell left without complete plans after a worker
+    raised on it (raised: {(z, x, y): the last error}; one a later pass planned is not left) is a failed bake, not a
+    cell the client plans: and a pack with no items is none."""
+    out = []
+    left = [(c[0], c[1], c[2]) for c in todo if (c[0], c[1], c[2]) in raised]
+    if left:
+        out.append(f"{len(left)} cells have no complete plans because a worker raised on them: " +
+                   "; ".join(f"{z}/{x}/{y} ({raised[(z, x, y)]})" for z, x, y in left))
+    if n_items == 0:
+        out.append("the pack would have no items")
+    return out
+
+
+def discard(writer):
+    """Drop what a bakepack.Writer has written so far: no pack, and no partial file beside it."""
+    writer.body.close()
+    for path in (writer.tmp + ".body", writer.tmp):
+        if os.path.exists(path):
+            os.remove(path)
+
+
 def _worker(args):
     cache, cells, out_jsonl, wid = args
     import logging
@@ -82,6 +104,7 @@ def _worker(args):
     bw.init(cache, False, True, True, True, True, None, logging.WARNING, True, True, 0, None, False)
     rec = open(out_jsonl, "a")
     record(plancache, roads, rec)
+    errors = []
     lat0, lon0 = cells[0][3], cells[0][4]
     g, _ = bw._s.anchor(1, lat0, lon0)
     md = bw._s.md
@@ -105,11 +128,12 @@ def _worker(args):
                     roads.road_specs(f, None, None, lh)
         except Exception as ex:          # (a cell short of something: left out, the client makes it)
             print(f"worker {wid}: cell {k}: {type(ex).__name__}: {ex}", flush=True)
+            errors.append([z, x, y, f"{type(ex).__name__}: {ex}"])
         done += 1
         if done % 10 == 0:
             print(f"worker {wid}: {done}/{len(cells)} cells, {time.time() - t0:.0f} s", flush=True)
     rec.close()
-    return json.loads(json.dumps(md.versions(), sort_keys=True))
+    return json.loads(json.dumps(md.versions(), sort_keys=True)), errors
 
 
 def main():
@@ -142,7 +166,7 @@ def main():
     for n_ in os.listdir(work):
         os.remove(os.path.join(work, n_))
     t0 = time.time()
-    todo, versions, jobs = cells, [], []
+    todo, versions, jobs, raised = cells, [], [], {}
     for pass_ in range(PASSES):
         # (a cell short of something in a pass (a download that failed, the lidar late) is planned again in the next,
         # in a run of its own: its incomplete plans in the last run's folder would be read instead)
@@ -151,7 +175,10 @@ def main():
         pj = [(a.cache, todo[i::a.procs], os.path.join(work, f"p{pass_}w{i}.jsonl"), i) for i in range(a.procs)]
         pj = [j for j in pj if j[1]]
         with multiprocessing.get_context("spawn").Pool(len(pj)) as pool:
-            versions += pool.map(_worker, pj)
+            for v, errors in pool.map(_worker, pj):
+                versions.append(v)
+                for z, x, y, why in errors:
+                    raised[(z, x, y)] = why
         jobs += pj
         have = set()
         for j in jobs:
@@ -199,6 +226,10 @@ def main():
             "bbox": [s, w, n, e], "made": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     if plancache.plans_variant():       # (made with Sofia's files: read only with them, bakepack._matches)
         meta["variant"] = plancache.plans_variant()
+    problems = fatal_problems(todo, raised, len(wr.items))
+    if problems:
+        discard(wr)
+        raise SystemExit("no pack written: " + "; ".join(problems))
     items = wr.close(meta)
     print(f"{a.out}: {items} items ({n_plans} plans, {n_facts} facts), {os.path.getsize(a.out) / 1e6:.1f} MB, "
           f"{time.time() - t0:.0f} s", flush=True)
