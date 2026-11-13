@@ -1,6 +1,6 @@
-"""A bridge part of a few metres at a junction is not an abutment of the chain it hangs on (2026-11-13, Sofia:
-Botevgradsko shosse and Madrid, Gotse Delchev and Tsar Boris III, Penchov Slaveykov): its street was graded 8 m up to
-clear a road under the chain's other parts."""
+"""Bridge parts that meet at one node (2026-11-13, Sofia: Botevgradsko shosse and Madrid, Gotse Delchev and Tsar Boris
+III, Penchov Slaveykov): a stub of a few metres of deck at a junction is not an abutment of the chain it hangs on, and
+the end of a deck a ground road leads onto keeps that road's height whatever deck it stands beside."""
 import os
 import sys
 import types
@@ -57,6 +57,33 @@ class StubLiftTest(unittest.TestCase):
         got = grading.bridge_lifts(tail, [self.b, tail], self.road, flat, chain=grading.bridge_chain(tail, [self.b, tail]))
         self.assertEqual(len(got), 1)
         self.assertGreater(got[0][1], 5.0)
+
+
+class AbutmentTieTest(unittest.TestCase):
+    """A narrow branch ending on the wide deck beside it; the street it leads onto at its free end."""
+
+    def setUp(self):
+        self.lines = [line((0.0, 0.0), (60.0, 0.0)), line((30.0, 3.0), (30.0, 100.0))]
+        self.specs = [types.SimpleNamespace(width=12.0, link=False), types.SimpleNamespace(width=6.0, link=False)]
+        self.zs = [np.full(2, 10.0), np.array([11.5, 20.0])]
+
+    def test_the_branch_follows_the_deck_it_stands_on(self):
+        out = roads._tie_beside(self.lines, self.zs, self.specs)
+        self.assertAlmostEqual(float(out[1][0]), 10.0)
+
+    def test_but_not_where_a_road_goes_on_from_its_end(self):
+        out = roads._tie_beside(self.lines, self.zs, self.specs, abutments=[(30.0, 3.0)])
+        self.assertAlmostEqual(float(out[1][0]), 11.5)
+
+    def test_a_far_end_a_road_leads_onto_keeps_its_height(self):
+        # the stub's node end follows the main deck, its free end (a street leads onto it) stays: the whole stub was
+        # carried to the deck's height before
+        lines = [line((0.0, 0.0), (60.0, 0.0)), line((30.0, 3.0), (31.0, 3.5))]
+        zs = [np.full(2, 10.0), np.array([11.5, 11.9])]
+        free = roads._tie_beside(lines, zs, self.specs, abutments=[(31.0, 3.5)])
+        self.assertAlmostEqual(float(free[1][-1]), 11.9, places=2)
+        carried = roads._tie_beside(lines, zs, self.specs)
+        self.assertLess(float(carried[1][-1]), 10.5)
 
 
 if __name__ == "__main__":

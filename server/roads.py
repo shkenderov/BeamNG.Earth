@@ -4192,14 +4192,35 @@ TIE_MEASURED_M = 0.5        # m: a part whose heights a source measured (roadz: 
                             # pulled measured ramps by I-395 1.6 and 4.9 m off the lidar's
 
 
-def _tie_beside(lines, zs, specs, measured=None):
+# ... but not an end a ground road goes on from: _tie_beside held a stub's free end, where the street leads onto it, at the
+# height of the main deck it stands beside, 2 m off the ground the street had been graded to (Penchov Slaveykov, Sofia: the
+# 3 m stub 0f878faa, deck end 563.0 over a street at 561.1). The same end of a ramp beside its road at a fork (no road goes
+# on there) is still held.
+TIE_ABUTMENT_ON = os.environ.get("BNE_TIE_ABUTMENT", "on") != "off"
+TIE_ABUTMENT_M = 1.0        # m: a ground road's end this near a deck's end leads onto it (PIN_M)
+
+
+def _ground_road_ends(ground_lines):
+    """The two ends of each ground road of PIN_ROAD_M or more (lines (k, >= 2)): (m, 2). Pure."""
+    out = []
+    for g in ground_lines:
+        g = np.asarray(g, np.float64)
+        if len(g) >= 2 and float(np.hypot(*np.diff(g[:, :2], axis=0).T).sum()) >= PIN_ROAD_M:
+            out += [g[0, :2], g[-1, :2]]
+    return np.array(out, np.float64).reshape(-1, 2)
+
+
+def _tie_beside(lines, zs, specs, measured=None, abutments=None):
     """zs with each branch (a ramp, else the narrower part) that leaves or joins another part (its end on that part's
     deck) held at
     that part's height while their slabs are joined (TIE_*), eased into its own profile after. lines: (k, >= 2) per
-    part, zs: heights per point, specs: their Specs. Pure."""
+    part, zs: heights per point, specs: their Specs. abutments: the ends of the ground roads that go on from a deck (a road
+    of PIN_ROAD_M or more, _ground_road_ends): a deck's end one of them leads onto is its abutment and keeps its own
+    height (TIE_ABUTMENT_M), whichever deck it stands on. Pure."""
     zs = [np.asarray(z, np.float64).copy() for z in zs]
     pts = [np.asarray(ln, np.float64)[:, :2] for ln in lines]
     n = len(pts)
+    ab = None if abutments is None or not len(abutments) else np.asarray(abutments, np.float64).reshape(-1, 2)
     arcs = [np.r_[0.0, np.cumsum(np.hypot(*np.diff(p, axis=0).T))] if len(p) >= 2 else np.zeros(len(p)) for p in pts]
 
     def project(j, q):
@@ -4218,6 +4239,8 @@ def _tie_beside(lines, zs, specs, measured=None):
         on the ground from it) or a joint with another part (that part goes on at i's height there); only an end on
         j's own deck and on nothing else follows j."""
         p = pts[i][e]
+        if ab is not None and TIE_ABUTMENT_ON and (np.hypot(ab[:, 0] - p[0], ab[:, 1] - p[1]) <= TIE_ABUTMENT_M).any():
+            return True             # (a road goes on from it on the ground)
         for k in range(n):
             if k in (i, j) or len(pts[k]) < 2:
                 continue
@@ -4232,6 +4255,8 @@ def _tie_beside(lines, zs, specs, measured=None):
         for e in (0, -1):
             p = pts[i][e]
             best = None
+            if ab is not None and TIE_ABUTMENT_ON and (np.hypot(ab[:, 0] - p[0], ab[:, 1] - p[1]) <= TIE_ABUTMENT_M).any():
+                continue            # (a road goes on from this end on the ground: its abutment, at that road's height)
             for j in range(n):
                 if j == i or len(pts[j]) < 2:
                     continue
@@ -7151,6 +7176,7 @@ class BridgeProfiles:
             return cache[str(key)]
 
     END_JOINS = True        # (TunnelProfiles: none)
+    TIE_ABUTMENTS = True    # (TunnelProfiles: none)
 
     def _end_joins_of(self, lines, halves, ground):
         """_end_joins of deck lines with the ground roads of ground ({(fid, "g"): lines}); [] for tunnels."""
@@ -7565,7 +7591,9 @@ class BridgeProfiles:
         tl.measured = set()
         zs = self._solve(comp, pool, ground)
         zs = _tie_beside([pool[k][1] for k in comp], zs, [pool[k][0] for k in comp],     # (ramps beside their road)
-                         [k in tl.measured for k in comp])
+                         [k in tl.measured for k in comp],
+                         _ground_road_ends([g for kk, v in ground.items() if kk[1] == "g" for g in v])
+                         if self.TIE_ABUTMENTS else None)
         with self.lock:
             for k, z in zip(comp, zs):
                 spec, xy, lon = pool[k][:3]
@@ -8044,6 +8072,7 @@ class TunnelProfiles(BridgeProfiles):
     keys_of = staticmethod(lambda feats, i: part_keys(feats, i, "tunnel"))
     levels_of = staticmethod(lambda feats, i: [-1.0] * len(tunnel_parts(feats, i)))
     END_JOINS = False
+    TIE_ABUTMENTS = False
 
     def _structure(self, chain):                # (no truss over a tunnel)
         return [], []
