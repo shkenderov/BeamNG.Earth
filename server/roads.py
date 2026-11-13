@@ -4318,6 +4318,70 @@ def _tie_beside(lines, zs, specs, measured=None, abutments=None):
     return zs
 
 
+# Deck parts that meet at a node (ends within _EndJoin's 0.5 m) and are of one level stand at one height there. A chain
+# solved in one curve has it; a chain the curve cannot meet (a junction whose abutments the clearances over the roads
+# under it ask too much of: deck_profile_once falls back to the per-part profile) leaves each part its own end, the
+# parts smoothed apart: Botevgradsko shosse and Madrid in Sofia, four parts at one node 535.5, 537.1, 541.4 and 535.4,
+# and 561.0 / 561.65 / 563.0 at a second junction of the Penchov Slaveykov bridges; steps of 1.4-6 m across a junction.
+# Each such node takes the height of its parts' ends averaged over their lengths (a stub a few metres long follows the
+# spans it joins, not the other way round), and each part is eased onto it (earthfast.deck_blend, as _observed does at a
+# measured deck's joints). Not a node a ground road goes on from (an abutment: _ground_pins), not parts of different
+# levels (stacked decks keep their separation), nothing within JOINT_TOL_M of one height already.
+JOINT_TIE_ON = os.environ.get("BNE_JOINT_TIE", "on") != "off"
+JOINT_TOL_M = 0.05
+
+
+def _tie_joints(lines, zs, levels=None, pins=None):
+    """zs with the ends of deck parts that meet at a node (JOINT_TIE_*) at one height; zs itself when there is none. lines:
+    (k, >= 2) per part, zs: heights per point, levels: the parts' levels (None: one), pins: _ground_pins' points. Pure."""
+    n = len(lines)
+    if not JOINT_TIE_ON or n < 2:
+        return zs
+    nk = _EndJoin()
+    nodes = {}
+    for i, ln in enumerate(lines):
+        ln = np.asarray(ln, np.float64)
+        if len(ln) < 2:
+            continue
+        for at in (0, -1):
+            nodes.setdefault(nk(ln[at][:2]), []).append((i, at))
+    P = None if pins is None or not len(pins) else np.asarray(pins, np.float64).reshape(-1, 2)
+    length = [float(np.hypot(*np.diff(np.asarray(ln, np.float64)[:, :2], axis=0).T).sum()) if len(ln) > 1 else 0.0
+              for ln in lines]
+    target = {}
+    for mem in nodes.values():
+        if len({i for i, _a in mem}) < 2:
+            continue
+        p = np.asarray(lines[mem[0][0]], np.float64)[mem[0][1], :2]
+        if P is not None and (np.hypot(P[:, 0] - p[0], P[:, 1] - p[1]) < PIN_M).any():
+            continue
+        by = {}
+        for i, at in mem:
+            by.setdefault(None if levels is None else levels[i], []).append((i, at))
+        for grp in by.values():
+            if len({i for i, _a in grp}) < 2:
+                continue
+            ez = np.array([float(zs[i][at]) for i, at in grp])
+            if not np.isfinite(ez).all() or float(ez.max() - ez.min()) <= JOINT_TOL_M:
+                continue
+            w = np.array([max(length[i], 0.5) for i, _at in grp])
+            t = float((w * ez).sum() / w.sum())
+            for key in grp:
+                target[key] = t
+    if not target:
+        return zs
+    import fast
+    out = list(zs)
+    for i in sorted({k[0] for k in target}):
+        ln = np.asarray(lines[i], np.float64)[:, :2]
+        z = np.asarray(zs[i], np.float64)
+        s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(ln, axis=0).T))]
+        t0, t1 = target.get((i, 0), float("nan")), target.get((i, -1), float("nan"))
+        out[i] = np.asarray(fast._ef.deck_blend(s, np.ascontiguousarray(z), float(t0), float(t1), OBS_BLEND_DG,
+                                                OBS_BLEND_MIN_M, 0.5), np.float64)
+    return out
+
+
 def _joined_lines(lines, joins):
     """lines with each end of joins moved onto its joint (copies; the others as they are)."""
     out = list(lines)
@@ -7177,6 +7241,7 @@ class BridgeProfiles:
 
     END_JOINS = True        # (TunnelProfiles: none)
     TIE_ABUTMENTS = True    # (TunnelProfiles: none)
+    JOINT_TIES = True       # (TunnelProfiles: none)
 
     def _end_joins_of(self, lines, halves, ground):
         """_end_joins of deck lines with the ground roads of ground ({(fid, "g"): lines}); [] for tunnels."""
@@ -7594,6 +7659,11 @@ class BridgeProfiles:
                          [k in tl.measured for k in comp],
                          _ground_road_ends([g for kk, v in ground.items() if kk[1] == "g" for g in v])
                          if self.TIE_ABUTMENTS else None)
+        if self.JOINT_TIES:
+            # (parts meeting at a node at one height: _tie_joints)
+            _l = [pool[k][1] for k in comp]
+            zs = _tie_joints(_l, zs, [pool[k][3] for k in comp],
+                             _ground_pins(_l, [g for kk, v in ground.items() if kk[1] == "g" for g in v]))
         with self.lock:
             for k, z in zip(comp, zs):
                 spec, xy, lon = pool[k][:3]
@@ -8073,6 +8143,7 @@ class TunnelProfiles(BridgeProfiles):
     levels_of = staticmethod(lambda feats, i: [-1.0] * len(tunnel_parts(feats, i)))
     END_JOINS = False
     TIE_ABUTMENTS = False
+    JOINT_TIES = False
 
     def _structure(self, chain):                # (no truss over a tunnel)
         return [], []

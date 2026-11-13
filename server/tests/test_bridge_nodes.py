@@ -1,6 +1,8 @@
 """Bridge parts that meet at one node (2026-11-13, Sofia: Botevgradsko shosse and Madrid, Gotse Delchev and Tsar Boris
-III, Penchov Slaveykov): a stub of a few metres of deck at a junction is not an abutment of the chain it hangs on, and
-the end of a deck a ground road leads onto keeps that road's height whatever deck it stands beside."""
+III, Penchov Slaveykov): a stub of a few metres of deck at a junction is not an abutment of the chain it hangs on (its
+street was graded 8 m up to clear a road under the chain's other parts), the parts of one level meeting at a node
+stand at one height there, and the end of a deck a ground road leads onto keeps that road's height whatever deck it
+stands beside."""
 import os
 import sys
 import types
@@ -57,6 +59,62 @@ class StubLiftTest(unittest.TestCase):
         got = grading.bridge_lifts(tail, [self.b, tail], self.road, flat, chain=grading.bridge_chain(tail, [self.b, tail]))
         self.assertEqual(len(got), 1)
         self.assertGreater(got[0][1], 5.0)
+
+
+class JointTieTest(unittest.TestCase):
+    """Three parts of one level meeting at (0, 0), each solved to its own end height."""
+
+    def parts(self):
+        lines = [np.c_[np.linspace(-30.0, 0.0, 31), np.zeros(31)], np.c_[np.linspace(0.0, 30.0, 31), np.zeros(31)],
+                 line((0.0, 0.0), (0.0, -2.0))]
+        zs = [np.linspace(10.0, 12.0, 31), np.linspace(14.0, 10.0, 31), np.array([18.0, 10.0])]
+        return lines, zs
+
+    def ends(self, zs):
+        return zs[0][-1], zs[1][0], zs[2][0]
+
+    def test_the_parts_meet_at_one_height(self):
+        lines, zs = self.parts()
+        out = roads._tie_joints(lines, zs, [1.0, 1.0, 1.0])
+        e = self.ends(out)
+        self.assertLess(max(e) - min(e), 1e-6)
+
+    def test_a_stub_follows_the_spans(self):
+        lines, zs = self.parts()
+        out = roads._tie_joints(lines, zs, [1.0, 1.0, 1.0])
+        want = (30 * 12.0 + 30 * 14.0 + 2 * 18.0) / 62.0        # (the mean of the ends over the parts' lengths)
+        self.assertAlmostEqual(float(out[0][-1]), want, places=6)
+
+    def test_the_free_ends_stay(self):
+        lines, zs = self.parts()
+        out = roads._tie_joints(lines, zs, [1.0, 1.0, 1.0])
+        self.assertAlmostEqual(float(out[0][0]), 10.0)
+        self.assertAlmostEqual(float(out[1][-1]), 10.0)
+        self.assertAlmostEqual(float(out[2][-1]), 10.0)
+
+    def test_decks_of_other_levels_keep_their_separation(self):
+        lines, zs = self.parts()
+        out = roads._tie_joints(lines, zs, [1.0, 1.0, 2.0])
+        self.assertAlmostEqual(float(out[2][0]), 18.0, msg="a part of its own level at the node is left")
+        self.assertAlmostEqual(float(out[0][-1]), float(out[1][0]), places=6, msg="the two of one level are tied")
+
+    def test_a_joint_a_ground_road_goes_on_from_is_an_abutment(self):
+        lines, zs = self.parts()
+        out = roads._tie_joints(lines, zs, [1.0, 1.0, 1.0], pins=[(0.0, 0.0)])
+        self.assertEqual([float(z[i]) for z, i in zip(out, (-1, 0, 0))], [12.0, 14.0, 18.0])
+
+    def test_nodes_that_agree_are_left_alone(self):
+        lines, zs = self.parts()
+        zs = [z.copy() for z in zs]
+        zs[1][0], zs[2][0] = zs[0][-1] + 0.01, zs[0][-1] - 0.02
+        out = roads._tie_joints(lines, zs, [1.0, 1.0, 1.0])
+        self.assertIs(out, zs)
+
+    def test_the_interior_keeps_its_profile(self):
+        lines, zs = self.parts()
+        out = roads._tie_joints(lines, zs, [1.0, 1.0, 1.0])
+        self.assertAlmostEqual(float(out[0][0]), 10.0)
+        self.assertAlmostEqual(float(out[0][len(out[0]) // 2]), float(zs[0][len(zs[0]) // 2]), delta=0.05)
 
 
 class AbutmentTieTest(unittest.TestCase):
